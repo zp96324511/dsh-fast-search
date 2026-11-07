@@ -1,6 +1,6 @@
 {
   "name": "dsh-fast-search",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "会话全文搜索：自建 SQLite FTS5 增量索引，侧栏独立面板，稳态查询 5–15ms；不随每轮对话重建，自带 GitHub Release 在线升级通道。",
   "type": "module",
   "main": "index.js",

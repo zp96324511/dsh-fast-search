@@ -50,8 +50,11 @@ export class Indexer {
     };
   }
 
-  /** @returns {Promise<string[]>} 目录下所有会话日志的绝对路径 */
-  async discover() {
+  /**
+   * @param {string[]} [problems] 遍历失败的位置（Windows 上 EPERM/EMFILE 偶发）
+   * @returns {Promise<string[]>} 目录下所有会话日志的绝对路径
+   */
+  async discover(problems = []) {
     /** @type {string[]} */
     const out = [];
     /** @param {string} dir */
@@ -59,7 +62,8 @@ export class Indexer {
       let entries;
       try {
         entries = await readdir(dir, { withFileTypes: true });
-      } catch {
+      } catch (err) {
+        problems.push(`${dir}: ${err?.code ?? err?.message ?? err}`);
         return;
       }
       for (const entry of entries) {
@@ -142,15 +146,22 @@ export class Indexer {
       docs: 0,
       startedAt: started,
       lastError: null,
+      partial: false,
     });
 
+    const problems = [];
     let files;
     try {
-      files = await this.discover();
+      files = await this.discover(problems);
     } catch (err) {
       this.state.phase = 'error';
       this.state.lastError = String(err?.message ?? err);
       throw err;
+    }
+
+    if (problems.length > 0) {
+      this.state.partial = true;
+      this.state.lastError = `遍历有 ${problems.length} 处失败：${problems[0]}`;
     }
 
     this.state.total = files.length;
@@ -194,15 +205,23 @@ export class Indexer {
       if (counter % 20 === 0) await yieldLoop();
     }
 
-    /* 文件被删掉的情况：水位线里有、这次没扫到 */
-    for (const knownPath of state.keys()) {
-      if (seen.has(knownPath)) continue;
-      try {
-        this.store.removeFile(knownPath);
-        this.state.removed += 1;
-      } catch {
-        /* 忽略单个文件的清理失败 */
+    /* 文件被删掉的情况：水位线里有、这次没扫到。
+     * 只在**遍历完全成功**时回收：walk 里一次 EPERM/EMFILE 就会让某个目录提前返回，
+     * 把那里的文件当成"已删除"，下一轮再全量重解一遍——索引没坏，但白白吃掉几十秒。 */
+    if (problems.length === 0) {
+      for (const knownPath of state.keys()) {
+        if (seen.has(knownPath)) continue;
+        try {
+          this.store.removeFile(knownPath);
+          this.state.removed += 1;
+        } catch {
+          /* 忽略单个文件的清理失败 */
+        }
       }
+    } else if (state.size > 0) {
+      this.log(
+        `[fast-search] 目录遍历有 ${problems.length} 处失败，本轮跳过删除回收（保留 ${state.size} 条水位线）`,
+      );
     }
 
     /* 大写入会把 WAL 撑到几十 MB，收尾时截断，别让磁盘上留一份主库副本 */

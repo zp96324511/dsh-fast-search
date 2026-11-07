@@ -25,17 +25,17 @@ DSH Web 的**会话全文搜索**插件：自带 SQLite FTS5 索引，侧栏一�
 
 ```powershell
 dsh plugin --profile web add `
-  "https://github.com/zp96324511/dsh-fast-search/releases/download/v0.2.0/dsh-fast-search.tgz"
-```
-
-装完就有了升级通道：面板右下角的版本号平时只是版本号，有新版本时变成 `↑ vX.Y.Z`，点一下即可换到新版（宿主侧代码需要一次重启，面板会给出按钮）。也可以手动：
-
-```powershell
-dsh plugin --profile web add `
   "https://github.com/zp96324511/dsh-fast-search/releases/latest/download/dsh-fast-search.tgz"
 ```
 
-`dsh-fast-search.tgz` 是一个**不带版本号的稳定名**——`releases/latest/download/<name>` 只解析 `latest` 这个 tag，不会替你改文件名，所以同一条命令永远装最新版。
+`dsh-fast-search.tgz` 是一个**不带版本号的稳定名**——`releases/latest/download/<name>` 只解析 `latest` 这个 tag，不会替你改文件名，所以同一条命令永远装最新版。要锁定版本就把 URL 换成带 tag 的那份：
+
+```powershell
+dsh plugin --profile web add `
+  "https://github.com/zp96324511/dsh-fast-search/releases/download/v0.2.0/dsh-fast-search-0.2.0.tgz"
+```
+
+**装完（或升级完）需要重启一次 `dsh web`**：宿主侧代码不参与 HMR，重启前跑的仍是旧版本。之后就有升级通道了——面板右下角的版本号平时只是版本号，有新版本时变成 `↑ vX.Y.Z`，点一下即可换到新版（宿主侧代码需要一次重启，面板会给出按钮）。
 
 ### 开发态安装（改代码即时生效）
 

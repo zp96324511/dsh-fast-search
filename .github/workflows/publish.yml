@@ -62,11 +62,13 @@ jobs:
           version=$(node -p "require('./package.json').version")
           file=$(npm pack --silent | tail -n 1)
           echo "packed: $file"
+          # npm pack 产出的就是 <name>-<version>.tgz；名字对不上时才改名（`cp` 同文件会直接报错）。
+          versioned="dsh-fast-search-${version}.tgz"
+          if [ "$file" != "$versioned" ]; then mv "$file" "$versioned"; fi
           # 稳定名是给 `releases/latest/download/<name>` 用的：它只解析 latest 这个 tag，
           # 不会替你改文件名，所以资产名里不能带版本号。
-          cp "$file" "dsh-fast-search-${version}.tgz"
-          cp "$file" "dsh-fast-search.tgz"
-          node scripts/make-channel.mjs "dsh-fast-search-${version}.tgz" channel.json
+          cp -f "$versioned" "dsh-fast-search.tgz"
+          node scripts/make-channel.mjs "$versioned" channel.json
           ls -l ./*.tgz channel.json
 
       - name: 建 release 并上传资产

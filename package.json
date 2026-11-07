@@ -1,0 +1,70 @@
+{
+  "name": "dsh-fast-search",
+  "version": "0.2.0",
+  "description": "会话全文搜索：自建 SQLite FTS5 增量索引，侧栏独立面板，稳态查询 5–15ms；不随每轮对话重建，自带 GitHub Release 在线升级通道。",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./update": "./update.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "update.js",
+    "respawn.cjs",
+    "cordis.patch.yml",
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "session-search",
+    "full-text-search",
+    "sqlite",
+    "fts5",
+    "self-update"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.2",
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zp96324511/dsh-fast-search.git"
+  },
+  "homepage": "https://github.com/zp96324511/dsh-fast-search#readme",
+  "bugs": {
+    "url": "https://github.com/zp96324511/dsh-fast-search/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node scripts/check-manifest.mjs && node --check index.js && node --check update.js && node --check client.js && node test/update-smoke.mjs && node test/client-smoke.mjs",
+    "test": "node test/update-smoke.mjs && node test/client-smoke.mjs && node test/verify.mjs",
+    "pack": "npm pack"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  }
+}

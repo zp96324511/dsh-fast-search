@@ -1,0 +1,82 @@
+name: publish
+
+# 打一个 v* tag 就等于发布：tarball（带版本号 + 稳定名）、channel.json、以及（可选）npm 包。
+# 升级通道读的是 `releases/latest/download/channel.json`，所以三个资产必须落在同一个 release 里。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: tag 必须等于 package.json 的版本
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag $tag does not match package.json version $version"
+            exit 1
+          fi
+          echo "publishing $version"
+
+      - name: 自检（清单 / 语法 / 冒烟）
+        env:
+          DSH_HOME: ${{ runner.temp }}/dsh-home
+        run: npm run check
+
+      # npm 是可选的第二通道：装了 `^0.2.0` 的人从这里升级，装 tarball 的人从 Release 升级。
+      # 没有配 NPM_TOKEN 就跳过，不让缺个 secret 挡住 release。
+      - name: npm publish（有 NPM_TOKEN 才跑）
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "NPM_TOKEN not set — skipping npm publish"
+            exit 0
+          fi
+          version=$(node -p "require('./package.json').version")
+          if npm view "dsh-fast-search@$version" version >/dev/null 2>&1; then
+            echo "dsh-fast-search@$version is already on npm — skipping"
+            exit 0
+          fi
+          npm publish --provenance --access public
+        continue-on-error: true
+
+      - name: 打包 + 生成 channel.json
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          file=$(npm pack --silent | tail -n 1)
+          echo "packed: $file"
+          # 稳定名是给 `releases/latest/download/<name>` 用的：它只解析 latest 这个 tag，
+          # 不会替你改文件名，所以资产名里不能带版本号。
+          cp "$file" "dsh-fast-search-${version}.tgz"
+          cp "$file" "dsh-fast-search.tgz"
+          node scripts/make-channel.mjs "dsh-fast-search-${version}.tgz" channel.json
+          ls -l ./*.tgz channel.json
+
+      - name: 建 release 并上传资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --verify-tag --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" ./*.tgz channel.json --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name'

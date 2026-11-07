@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # 零依赖项目不需要 install；这一步既是校验，也是「真的没有运行期依赖」的证明。
+      - name: manifest + syntax + smoke tests
+        env:
+          DSH_HOME: ${{ runner.temp }}/dsh-home
+        run: npm run check

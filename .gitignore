@@ -1,0 +1,10 @@
+# 运行时与基准产物
+.tmp/
+bench/out/
+bench/out-small/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.log.err
+node_modules/

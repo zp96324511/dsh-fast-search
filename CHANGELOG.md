@@ -1,5 +1,22 @@
 # 变更记录
 
+## 0.4.3 — 2026-11-09
+
+**修正索引的数据根。** `sessionsDir` / `dbPath` 的默认值不再写死 `~/.dsh`，改为与 DSH 同口径：
+显式配置 > `$DSH_HOME` > `~/.dsh`。
+
+- 病灶：`DSH_HOME` 不在用户目录的机器（如 Windows 上 `D:\DeepSeekHarness\data`）会去索引
+  `C:\Users\<user>\.dsh\sessions`——那往往是一份历史遗留的旧 home。表现是工作区下拉只剩几个
+  旧项目、近期会话一条都搜不到，而界面本身毫无异常，很容易被误判成前端 bug
+  （yhzp 实测：16 场 / 2,024 条 / 2 个工作区，真实数据是 520 个会话日志、19 个项目目录）。
+- 修复：`index.js` 新增 `resolveDataPaths()`，复用 `update.js` 已有的 `resolveDshHome()`
+  ——升级通道早就按 `$DSH_HOME` 找 profile，只有索引这两条路径没跟上，属于插件内部不自洽。
+- 升级影响：`DSH_HOME` 与 `~/.dsh` 相同的机器（含 win10）行为逐字节不变；不同的机器第一次
+  启动会在 `$DSH_HOME/storages/fast-search.db` 全量重建索引（会话日志本来就可重建），
+  旧位置那份索引的是错误目录，可以直接删。
+- 新增 `test/paths-smoke.mjs`：`$DSH_HOME` 生效、显式配置优先、空白 `$DSH_HOME` 回退、
+  默认 `~/.dsh` 四组断言，并接进 `npm run check` / `npm test`。
+
 ## 0.4.2 — 2026-11-09
 
 **修正运行要求。** 功能与 0.4.1 相同；0.3.0 起存储层直接使用内置 `node:sqlite`，

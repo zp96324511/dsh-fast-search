@@ -260,6 +260,11 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 
 `apiKey` 等价于明文密码，写在 patch 里就要保证那个文件只有你自己能读。
 
+不写 `sessionsDir` / `dbPath` 时，落点跟着 DSH 的数据根走：`$DSH_HOME`（未设置则 `~/.dsh`）
+下的 `sessions/` 与 `storages/fast-search.db`，与 DSH 自己的 `resolveDshHome` 同口径。
+`DSH_HOME` 不在用户目录的机器（例如 Windows 上 `D:\DeepSeekHarness\data`）不要手动指到
+`~/.dsh`——那里可能只是一份更早的旧 home，索引它会让面板只剩几个旧项目。
+
 ## 在线升级
 
 升级通道分三步，任何一步失败都只影响那一步：

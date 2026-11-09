@@ -10,13 +10,12 @@
  */
 
 import path from 'node:path';
-import os from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { Store } from './src/store.js';
 import { Indexer } from './src/indexer.js';
 import { VectorEngine } from './src/vectors.js';
 import { createHandler } from './src/router.js';
-import { LOADED_VERSION, createUpdater, createUpdateRoutes } from './update.js';
+import { LOADED_VERSION, createUpdater, createUpdateRoutes, resolveDshHome } from './update.js';
 
 export const name = 'dsh-fast-search';
 
@@ -27,6 +26,26 @@ export const version = LOADED_VERSION;
 export const API_PREFIX = '/plugin-api/dsh-fast-search';
 
 /**
+ * 索引目录与索引库的落点：显式配置 > `$DSH_HOME` > `~/.dsh`。
+ *
+ * DSH 自己的数据根就是这个优先级（`@deepseek-ai/dsh-home-paths` 的
+ * `resolveDshHome`，base profile 里会话库写的是 `root: !!js dshHomePath('sessions')`），
+ * 这里必须同口径。**不能**写死 `os.homedir()`：在 `DSH_HOME=D:\DeepSeekHarness\data`
+ * 这类机器上，`~/.dsh` 只是一份历史遗留的旧 home，索引它会让工作区下拉只剩几个旧项目、
+ * 近期会话一条都搜不到——而且看起来像前端出了问题（见 0.4.3 变更记录）。
+ *
+ * @param {{ sessionsDir?: string, dbPath?: string }} [config]
+ * @returns {{ sessionsDir: string, dbPath: string }}
+ */
+export function resolveDataPaths(config = {}) {
+  const home = path.resolve(resolveDshHome());
+  return {
+    sessionsDir: config.sessionsDir ?? path.join(home, 'sessions'),
+    dbPath: config.dbPath ?? path.join(home, 'storages', 'fast-search.db'),
+  };
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ sessionsDir?: string, dbPath?: string, cap?: number, bootDelayMs?: number,
  *           watch?: boolean, sweepMs?: number,
@@ -34,8 +53,7 @@ export const API_PREFIX = '/plugin-api/dsh-fast-search';
  *           vectors?: Record<string, any> }} [config]
  */
 export async function apply(ctx, config = {}) {
-  const sessionsDir = config.sessionsDir ?? path.join(os.homedir(), '.dsh', 'sessions');
-  const dbPath = config.dbPath ?? path.join(os.homedir(), '.dsh', 'storages', 'fast-search.db');
+  const { sessionsDir, dbPath } = resolveDataPaths(config);
   const log = (message) => {
     try {
       if (typeof ctx.logger === 'function') ctx.logger(`${name}: ${message}`);

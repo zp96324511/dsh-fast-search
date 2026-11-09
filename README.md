@@ -21,6 +21,8 @@ DSH Web 的**会话全文搜索**插件：自带 SQLite FTS5 索引，侧栏一�
 
 ## 安装
 
+运行要求：Node.js **22.13+**（插件直接用内置 `node:sqlite`，更早的版本没有这个模块；DSH 宿主本身要求 24.9+）。
+
 ### 从 GitHub Release 安装（推荐，支持在线升级）
 
 ```powershell
@@ -32,7 +34,7 @@ dsh plugin --profile web add `
 
 ```powershell
 dsh plugin --profile web add `
-  "https://github.com/zp96324511/dsh-fast-search/releases/download/v0.4.1/dsh-fast-search-0.4.1.tgz"
+  "https://github.com/zp96324511/dsh-fast-search/releases/download/v0.4.2/dsh-fast-search-0.4.2.tgz"
 ```
 
 **装完（或升级完）需要手动重启一次 `dsh web`**：宿主侧代码不参与 HMR，重启前跑的仍是旧版本。之后就有升级通道了——面板状态行里、重建索引按钮后面的版本号平时只是版本号，有新版本时变成 `↑ vX.Y.Z`，点一下即可换到新版。插件只提示「请手动重启 dsh web」，不会替你操作宿主进程（宿主可能带自定义参数、端口或环境变量）。
@@ -275,7 +277,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 # 2. 本地自检
 npm run check
 # 3. 提交并打 tag（tag 必须等于 version，publish.yml 会校验）
-git add -A; git commit -m "release 0.4.1"; git tag v0.4.1
+git add -A; git commit -m "release 0.4.2"; git tag v0.4.2
 git push origin main --tags
 ```
 
@@ -346,4 +348,4 @@ node bench\cdp-click.mjs   9222      # 点结果跳会话 + 回来恢复上次�
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。最近一次：**0.4.1** — 过滤与语义下拉前置到搜索框上方，搜索按钮、自定义起止日期、深色弹层修复，重建按钮与版本号同排；升级后只提示手动重启，移除宿主重启端点。
+见 [CHANGELOG.md](CHANGELOG.md)。最近一次：**0.4.2** — 明确 Node.js 22.13+ 运行要求（`node:sqlite`），CI 覆盖 22/24/26；功能与 0.4.1 相同。

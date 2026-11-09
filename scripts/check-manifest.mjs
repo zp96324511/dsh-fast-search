@@ -48,7 +48,7 @@ if (pkg !== undefined) {
     if (isAbsolute(entry)) fail(`files[] entry is absolute: ${entry}`)
     if (!existsSync(join(root, entry))) fail(`files[] entry does not exist: ${entry}`)
   }
-  for (const required of ['index.js', 'client.js', 'update.js', 'respawn.cjs', 'cordis.patch.yml', 'README.md', 'LICENSE', 'CHANGELOG.md']) {
+  for (const required of ['index.js', 'client.js', 'update.js', 'cordis.patch.yml', 'README.md', 'LICENSE', 'CHANGELOG.md']) {
     if (!files.includes(required)) fail(`files[] must include ${required}`)
   }
 

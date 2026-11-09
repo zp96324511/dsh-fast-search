@@ -9,8 +9,8 @@
  * 2. **升级**——跑一条用户自己也会敲的命令：`dsh plugin --profile <p> add <spec>`。
  *    走同一条路意味着继承插件管理器的清单锁、失败回滚和兼容性检查；而且是
  *    「就地换版本」而不是先卸载再装（自升级半路失败必须还能用）。
- * 3. **重启**——宿主自己退出，一个脱离的 helper 等旧进程死掉、端口释放后把同一条
- *    命令再拉起来。没有监督进程时直接退出会把 GUI 变成一具尸体。
+ * 3. **重启**——不做。宿主可能由外部脚本带自定义参数、端口和环境变量拉起，
+ *    插件只提示用户手动重启 dsh web，绝不替用户操作宿主进程。
  *
  * 通道形态（按 profile 里的依赖 spec 自动判断）：
  * - `https://github.com/<owner>/<repo>/releases/download/vX.Y.Z/<pkg>.tgz` → GitHub Release
@@ -54,7 +54,6 @@ const LOG_LIMIT = 48 * 1024;
 const CHECK_TTL_MS = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8000;
 const UPGRADE_TIMEOUT_MS = 15 * 60 * 1000;
-const DEFAULT_WEB_PORT = 10550;
 
 /* ------------------------------------------------------------------ *
  * 版本号
@@ -270,17 +269,6 @@ export function readProfileDependency(profileDir, name = PACKAGE_NAME) {
   if (manifest === undefined) return { spec: undefined, kind: 'unknown', manifest: undefined };
   const spec = manifest.dependencies?.[name] ?? manifest.devDependencies?.[name];
   return { spec, ...classifySpec(spec), manifest };
-}
-
-/** 本进程服务的 web 端口，重启时要等它释放。 */
-function resolvePort(argv) {
-  for (let index = 0; index < argv.length; index += 1) {
-    const argument = argv[index];
-    if (argument === '--port' && index + 1 < argv.length) return Number(argv[index + 1]) || undefined;
-    const inline = /^--port=(.+)$/.exec(argument);
-    if (inline !== null) return Number(inline[1]) || undefined;
-  }
-  return undefined;
 }
 
 /** 正在跑的 DSH 启动脚本（`.../@deepseek-ai/dsh/lib/bin.js`）。 */
@@ -794,55 +782,6 @@ export function createUpdater({ ctx, config, logger, spawn: spawnProcess = spawn
     return () => { job.listeners.delete(listener); };
   }
 
-  /**
-   * 重启宿主。
-   * `respawn`（默认）起一个脱离的 helper，等本进程退出、端口释放后重跑同一命令行；
-   * `exit` 留给有监督进程的宿主；`none` 只报告用户该做什么。
-   */
-  function restart() {
-    const restartConfig = updateConfig().restart ?? {};
-    const mode = typeof restartConfig.mode === 'string' ? restartConfig.mode : 'respawn';
-    if (mode === 'none') return { ok: true, mode, restarted: false };
-    if (mode === 'exit') {
-      setTimeout(() => process.exit(0), 150);
-      return { ok: true, mode, restarted: true };
-    }
-    const cli = launcher();
-    if (cli === undefined) {
-      setTimeout(() => process.exit(0), 150);
-      return { ok: true, mode: 'exit', restarted: true, warning: 'launcher not found: exited without a respawn helper' };
-    }
-    const helper = join(HERE, 'respawn.cjs');
-    if (!existsSync(helper)) {
-      setTimeout(() => process.exit(0), 150);
-      return { ok: true, mode: 'exit', restarted: true, warning: 'respawn.cjs missing from the package: exited without a helper' };
-    }
-    const payload = {
-      pid: process.pid,
-      argv: [process.execPath, cli, ...process.argv.slice(2)],
-      cwd: process.cwd(),
-      env: { ...process.env },
-      port: resolvePort(process.argv) ?? Number(restartConfig.port ?? DEFAULT_WEB_PORT),
-      log: restartConfig.logFile ?? join(resolveDshHome(), 'logs', `${basename(process.argv[1] ?? 'dsh').replace(/\.js$/, '')}-respawn.log`),
-    };
-    try {
-      const child = spawnProcess(process.execPath, [helper, Buffer.from(JSON.stringify(payload)).toString('base64')], {
-        detached: true,
-        windowsHide: true,
-        stdio: 'ignore',
-        cwd: payload.cwd,
-        env: process.env,
-      });
-      child.unref();
-    } catch (error) {
-      warn(`${PACKAGE_NAME}: respawn helper failed to start: ${String(error)}`);
-      return { ok: false, mode: 'respawn', restarted: true, error: String(error?.message ?? error) };
-    }
-    // 留一点时间让响应写回浏览器，再退出。
-    setTimeout(() => process.exit(0), 250);
-    return { ok: true, mode: 'respawn', restarted: true, log: payload.log };
-  }
-
   function dispose() {
     const job = state.job;
     if (job?.state === 'running') {
@@ -852,7 +791,7 @@ export function createUpdater({ ctx, config, logger, spawn: spawnProcess = spawn
     state.job?.listeners.clear();
   }
 
-  return { version, check, upgrade, restart, subscribe, jobView: () => jobView(state.job), dispose, profile, channel };
+  return { version, check, upgrade, subscribe, jobView: () => jobView(state.job), dispose, profile, channel };
 }
 
 /* ------------------------------------------------------------------ *
@@ -913,11 +852,6 @@ export function createUpdateRoutes(updater, { prefix = '/plugin-api/dsh-fast-sea
       /* 200 而不是 4xx/202：请求本身被理解了，装不装得上由 `ok` + `reason` 说，
        * 免得客户端把「已经是最新版」当成网络错误。 */
       reply(res, 200, result);
-      return true;
-    }
-    if (route === '/update/restart' && req.method === 'POST') {
-      const result = updater.restart();
-      reply(res, result.ok ? 200 : 500, result);
       return true;
     }
     return false;

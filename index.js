@@ -14,6 +14,7 @@ import os from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { Store } from './src/store.js';
 import { Indexer } from './src/indexer.js';
+import { VectorEngine } from './src/vectors.js';
 import { createHandler } from './src/router.js';
 import { LOADED_VERSION, createUpdater, createUpdateRoutes } from './update.js';
 
@@ -28,7 +29,9 @@ export const API_PREFIX = '/plugin-api/dsh-fast-search';
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ sessionsDir?: string, dbPath?: string, cap?: number, bootDelayMs?: number,
- *           watch?: boolean, sweepMs?: number }} [config]
+ *           watch?: boolean, sweepMs?: number,
+ *           search?: { mode?: 'off'|'auto'|'on' },
+ *           vectors?: Record<string, any> }} [config]
  */
 export async function apply(ctx, config = {}) {
   const sessionsDir = config.sessionsDir ?? path.join(os.homedir(), '.dsh', 'sessions');
@@ -45,12 +48,20 @@ export async function apply(ctx, config = {}) {
   mkdirSync(path.dirname(dbPath), { recursive: true });
 
   const store = new Store(dbPath);
+
+  /* 语义索引完全可选：没配 url（或 enabled=false）时这个对象是空壳，
+   * 索引路线、查询路线、HTTP 路由都和引入它之前一致。 */
+  const vectors = new VectorEngine({ store, config: config.vectors ?? {}, log });
+
   const indexer = new Indexer({
     store,
     root: sessionsDir,
     cap: Number.isFinite(config.cap) ? Number(config.cap) : 8192,
     log,
     watch: config.watch !== false,
+    /* 索引器一落盘就通知向量流水线：只补这个文件新增的块 */
+    onIndexed: (file) => vectors.queuePath(file),
+    onRemoved: (file) => vectors.removePath(file),
   });
 
   ctx.effect(() => {
@@ -67,8 +78,12 @@ export async function apply(ctx, config = {}) {
 
     indexer.startWatch({ intervalMs: Number.isFinite(config.sweepMs) ? Number(config.sweepMs) : 15 * 60 * 1000 });
 
+    /* 向量建库比 FTS 晚一步起：先把索引对上账，再让后台慢慢嵌入（服务端很慢，见 docs/semantic.md） */
+    if (vectors.enabled) vectors.start();
+
     return () => {
       clearTimeout(timer);
+      vectors.stop();
       indexer.stop();
       store.close();
     };
@@ -90,6 +105,8 @@ export async function apply(ctx, config = {}) {
       const handler = createHandler({
         store,
         indexer,
+        vectors,
+        searchMode: config.search?.mode ?? 'auto',
         basePath: API_PREFIX,
         sessionsDir,
         dbPath,

@@ -1,0 +1,347 @@
+#!/usr/bin/env node
+/**
+ * 语义索引冒烟测试：不碰网络，用一个"概念轴"假嵌入器把整条链路跑通。
+ *
+ * 假嵌入器不是玩具：它把同义词映射到同一根轴（缓存/加速/预热 → 轴 0），
+ * 所以"用词不同的查询能不能召回"这个语义检索的核心命题是真被测到的，
+ * 而不是"向量能存能取"这种表面一致性。
+ *
+ * 覆盖：切块不变量 → 建库 → 语义召回 → RRF 融合 → 重启后免重建 →
+ *       追加写盘只补新块（且老块的 rowid 能跟着重指）→ 删文件清向量 → 换模型整库作废。
+ */
+import assert from 'node:assert/strict';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdirSync, rmSync } from 'node:fs';
+import { Store } from '../src/store.js';
+import { VectorEngine } from '../src/vectors.js';
+import { searchWithSemantic } from '../src/search.js';
+import { chunkText, estimateTokens, hashText } from '../src/chunk.js';
+
+const DIM = 48;
+const root = path.join(process.cwd(), '.tmp', 'vectors-smoke');
+rmSync(root, { recursive: true, force: true });
+mkdirSync(root, { recursive: true });
+const dbPath = path.join(root, 'search.db');
+
+/* ── 假嵌入器：概念轴 + 稳定噪声 ─────────────────────────────── */
+const CONCEPTS = [
+  ['缓存', 'cache', '快照', '加速', '变快', '预热', '命中率'],
+  ['索引', 'index', '倒排', '建库', '重建', '全文'],
+  ['沙箱', 'sandbox', '权限', 'acl', '拒绝'],
+  ['插件', 'plugin', '扩展', '面板', '侧栏'],
+];
+
+function fakeVector(text) {
+  const vec = new Float32Array(DIM);
+  const lower = String(text).toLowerCase();
+  for (let axis = 0; axis < CONCEPTS.length; axis++) {
+    if (CONCEPTS[axis].some((word) => lower.includes(word))) vec[axis] += 1;
+  }
+  const seed = hashText(lower);
+  let state = 0;
+  for (let i = 0; i < seed.length; i++) state = (state * 31 + seed.charCodeAt(i)) >>> 0;
+  for (let i = CONCEPTS.length; i < DIM; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    vec[i] = ((state >>> 8) % 2000) / 100000;
+  }
+  let norm = 0;
+  for (let i = 0; i < DIM; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < DIM; i++) vec[i] /= norm;
+  return vec;
+}
+
+class FakeEmbedder {
+  constructor() {
+    this.calls = 0;
+    this.texts = 0;
+    this.stats = { calls: 0, texts: 0 };
+  }
+
+  async embedTexts(texts) {
+    this.calls += 1;
+    this.texts += texts.length;
+    this.stats = { calls: this.calls, texts: this.texts };
+    return texts.map((text) => fakeVector(text));
+  }
+
+  async embedOne(text) {
+    const [vec] = await this.embedTexts([text]);
+    return vec;
+  }
+
+  async probe() {
+    return { ok: true, dim: DIM, ms: 0 };
+  }
+}
+
+/* ── 断言脚手架 ─────────────────────────────────────────────── */
+let passed = 0;
+const failures = [];
+function check(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    process.stdout.write(`  ✓ ${name}\n`);
+  } catch (err) {
+    failures.push(`${name}: ${err.message}`);
+    process.stdout.write(`  ✗ ${name} — ${err.message}\n`);
+  }
+}
+async function checkAsync(name, fn) {
+  try {
+    await fn();
+    passed += 1;
+    process.stdout.write(`  ✓ ${name}\n`);
+  } catch (err) {
+    failures.push(`${name}: ${err.message}`);
+    process.stdout.write(`  ✗ ${name} — ${err.message}\n`);
+  }
+}
+
+const engineConfig = {
+  enabled: true,
+  url: 'http://fake.invalid/v1/embeddings',
+  model: 'fake-bge',
+  dim: DIM,
+  kinds: ['user/message', 'assistant/message', 'session/title'],
+  chunkChars: 200,
+  chunkOverlap: 20,
+  batch: 4,
+  topK: 20,
+  /* 命中数 ≥ 1 就不再补语义：这样"缓存"（1 条字面命中）走纯 FTS、"加速"（0 条）走语义 */
+  autoThreshold: 1,
+};
+
+/* ── 1. 切块不变量 ─────────────────────────────────────────── */
+process.stdout.write('切块\n');
+check('空文本不产生块', () => assert.deepEqual(chunkText(''), []));
+check('短文本整块返回且偏移正确', () => {
+  const raw = '  hello 插件  ';
+  const [chunk] = chunkText(raw, { maxChars: 480 });
+  assert.equal(chunk.text, 'hello 插件');
+  assert.equal(raw.slice(chunk.start, chunk.end), chunk.text);
+});
+check('长文本每块 ≤ maxChars 且偏移可还原', () => {
+  const raw = ('这是一个很长的中文句子，用来测试切块行为。'.repeat(40) + '\n').repeat(3);
+  const chunks = chunkText(raw, { maxChars: 160 });
+  assert.ok(chunks.length > 3, `块数 ${chunks.length}`);
+  for (const chunk of chunks) {
+    assert.ok(chunk.text.length <= 160, `块长 ${chunk.text.length}`);
+    assert.equal(raw.slice(chunk.start, chunk.end), chunk.text);
+    assert.equal(chunk.hash, hashText(chunk.text));
+  }
+});
+check('token 估算：中文按字、英文按 3.5 字符', () => {
+  assert.equal(estimateTokens('中文'), 2);
+  assert.equal(estimateTokens('abcdefg'), 2);
+});
+
+/* ── 2. 建库 + 语义召回 ────────────────────────────────────── */
+process.stdout.write('建库与召回\n');
+const store = new Store(dbPath);
+const fileA = path.join(root, 'a.jsonl.zstd');
+const fileB = path.join(root, 'b.jsonl.zstd');
+
+const docsA = [
+  {
+    seq: 1,
+    kind: 'user/message',
+    role: 'user',
+    time: 1000,
+    text: '会话日志的缓存命中率怎么提升，预热要多久，有没有更快的办法',
+  },
+  {
+    seq: 2,
+    kind: 'assistant/message',
+    role: 'assistant',
+    time: 2000,
+    text: '倒排索引重建大概 24 秒，不必每次启动都做，改成增量对账就够了',
+  },
+];
+const docsB = [
+  {
+    seq: 1,
+    kind: 'user/message',
+    role: 'user',
+    time: 3000,
+    text: '沙箱把工作区写入拒绝了，acl 是不是有问题',
+  },
+];
+const header = { id: 'session-a', cwd: 'C:\\work', createdAt: 1 };
+
+store.replaceFile(fileA, { size: 100, mtimeMs: 1000, header, title: '缓存与索引', docs: docsA });
+store.replaceFile(fileB, {
+  size: 100,
+  mtimeMs: 2000,
+  header: { ...header, id: 'session-b' },
+  title: '沙箱权限',
+  docs: docsB,
+});
+
+const embedder = new FakeEmbedder();
+const engine = new VectorEngine({
+  store,
+  config: engineConfig,
+  embedder,
+  log: () => {},
+});
+
+await checkAsync('同步写入向量块', async () => {
+  const result = await engine.sync();
+  assert.ok(result, 'sync 应返回结果');
+  assert.ok(engine.vs.live >= 3, `块数 ${engine.vs.live}`);
+});
+
+await checkAsync('语义召回：用「加速」找到只说了「缓存/预热」的消息', async () => {
+  const recall = await engine.semanticSearch('加速', { topK: 5 });
+  assert.equal(recall.reason, 'ok');
+  assert.ok(recall.hits.length > 0, '没有命中');
+  const top = recall.hits[0];
+  assert.match(top.chunk, /缓存|预热/, `首条内容：${top.chunk}`);
+  assert.equal(top.sessionId, 'session-a');
+});
+
+await checkAsync('向量命中携带可渲染的片段与元数据', async () => {
+  const recall = await engine.semanticSearch('加速', { topK: 5 });
+  const top = recall.hits[0];
+  assert.ok(typeof top.seq === 'number' && typeof top.kind === 'string');
+  assert.ok(top.chunk.length > 0 && top.chunk.length <= 200);
+});
+
+await checkAsync('无关查询被 minScore 挡住，不把噪声当结果', async () => {
+  const recall = await engine.semanticSearch('今天天气怎么样', { topK: 5 });
+  assert.equal(recall.reason, 'no-match');
+  assert.equal(recall.hits.length, 0);
+  assert.ok(typeof recall.topScore === 'number' && recall.topScore < 0.45, `topScore ${recall.topScore}`);
+});
+
+await checkAsync('FTS 字面命中时不掺向量（auto 模式）', async () => {
+  const result = await searchWithSemantic({
+    store,
+    engine,
+    q: '缓存',
+    mode: 'auto',
+    options: { limit: 300, groupLimit: 20, perSession: 6 },
+  });
+  assert.ok(result.total > 0, 'FTS 应该有命中');
+  assert.equal(result.semantic.used, false);
+  assert.equal(result.semantic.reason, 'enough-fts');
+  for (const group of result.groups) {
+    for (const doc of group.docs) assert.notEqual(doc.source, 'vec');
+  }
+});
+
+await checkAsync('FTS 空结果时自动补语义（auto 模式）', async () => {
+  const result = await searchWithSemantic({
+    store,
+    engine,
+    q: '加速',
+    mode: 'auto',
+    options: { limit: 300, groupLimit: 20, perSession: 6 },
+  });
+  assert.equal(result.semantic.used, true);
+  assert.ok(result.groups.length > 0, '融合后应该有分组');
+  const docs = result.groups.flatMap((group) => group.docs);
+  const semanticDocs = docs.filter((doc) => doc.source === 'vec');
+  assert.ok(semanticDocs.length > 0, '应该有纯语义命中的文档');
+  const doc = semanticDocs[0];
+  assert.ok(Array.isArray(doc.snippet) && doc.snippet.length > 0, '语义命中要有片段');
+  assert.equal(result.groups[0].sessionId, 'session-a');
+});
+
+await checkAsync('off 模式不碰向量', async () => {
+  const result = await searchWithSemantic({
+    store,
+    engine,
+    q: '加速',
+    mode: 'off',
+    options: { limit: 300, groupLimit: 20, perSession: 6 },
+  });
+  assert.equal(result.semantic.used, false);
+  assert.equal(result.groups.length, 0);
+});
+
+/* ── 3. 重启不重建 ─────────────────────────────────────────── */
+process.stdout.write('持久化与增量\n');
+const before = embedder.texts;
+store.close();
+
+const store2 = new Store(dbPath);
+const embedder2 = new FakeEmbedder();
+const engine2 = new VectorEngine({ store: store2, config: engineConfig, embedder: embedder2, log: () => {} });
+
+await checkAsync('重启后免重建（不再调用嵌入服务）', async () => {
+  const result = await engine2.sync();
+  assert.equal(result.chunks, 0, `新增了 ${result.chunks} 块`);
+  assert.equal(embedder2.texts, 0, `嵌入了 ${embedder2.texts} 条`);
+  assert.ok(engine2.vs.live >= 3);
+});
+
+await checkAsync('重启后语义召回仍然可用', async () => {
+  const recall = await engine2.semanticSearch('加速', { topK: 5 });
+  assert.ok(recall.hits.length > 0);
+  assert.match(recall.hits[0].chunk, /缓存|预热/);
+});
+
+const appended = [
+  ...docsA,
+  {
+    seq: 3,
+    kind: 'assistant/message',
+    role: 'assistant',
+    time: 4000,
+    text: '可以把预热缓存放在宿主启动之后，这样首查就不冷了',
+  },
+];
+store2.replaceFile(fileA, { size: 200, mtimeMs: 3000, header, title: '缓存与索引', docs: appended });
+
+await checkAsync('整文件重解后只嵌新增块，且老块 rowid 重指成功', async () => {
+  const result = await engine2.sync({ paths: [fileA] });
+  assert.equal(result.chunks, 1, `新增块数 ${result.chunks}`);
+  assert.ok(result.retargeted >= 1, `重指 ${result.retargeted} 条`);
+  const recall = await engine2.semanticSearch('加速', { topK: 8 });
+  const metas = store2.docsByRid(JSON.stringify(recall.hits.map((hit) => hit.rid)));
+  for (const hit of recall.hits) {
+    assert.ok(metas.has(hit.rid), `rid ${hit.rid} 指向了不存在的文档`);
+  }
+});
+
+await checkAsync('删文件后不再出现在语义结果里', async () => {
+  engine2.removePath(fileA);
+  store2.removeFile(fileA);
+  const recall = await engine2.semanticSearch('加速', { topK: 8 });
+  assert.equal(
+    recall.hits.filter((hit) => hit.sessionId === 'session-a').length,
+    0,
+    '已删会话仍被召回',
+  );
+});
+
+/* ── 4. 换模型整库作废 ────────────────────────────────────── */
+await checkAsync('换模型后旧向量作废并重建', async () => {
+  store2.close();
+  const store3 = new Store(dbPath);
+  const embedder3 = new FakeEmbedder();
+  const engine3 = new VectorEngine({
+    store: store3,
+    config: { ...engineConfig, model: 'another-model' },
+    embedder: embedder3,
+    log: () => {},
+  });
+  await engine3.init();
+  assert.equal(engine3.vs.live, 0, `换模型后还剩 ${engine3.vs.live} 块`);
+  const result = await engine3.sync();
+  assert.ok(result.chunks > 0, '应该重建');
+  store3.close();
+});
+
+/* ── 结果 ─────────────────────────────────────────────────── */
+process.stdout.write('\n');
+if (failures.length > 0) {
+  for (const failure of failures) process.stderr.write(`  ✗ ${failure}\n`);
+  process.stderr.write(`vectors-smoke: ${failures.length} 个失败 / ${passed} 个通过\n`);
+  process.exit(1);
+}
+process.stdout.write(`vectors-smoke: ok (${passed} 项，嵌入调用 ${before + 0} → 见上)\n`);

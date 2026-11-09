@@ -23,14 +23,25 @@ const yieldLoop = () => new Promise((resolve) => setImmediate(resolve));
 export class Indexer {
   /**
    * @param {{ store: import('./store.js').Store, root: string, cap?: number,
-   *           log?: (msg: string) => void, watch?: boolean }} options
+   *           log?: (msg: string) => void, watch?: boolean,
+   *           onIndexed?: (file: string) => void, onRemoved?: (file: string) => void }} options
    */
-  constructor({ store, root, cap = 8192, log = () => {}, watch: enableWatch = true }) {
+  constructor({
+    store,
+    root,
+    cap = 8192,
+    log = () => {},
+    watch: enableWatch = true,
+    onIndexed = () => {},
+    onRemoved = () => {},
+  }) {
     this.store = store;
     this.root = root;
     this.cap = cap;
     this.log = log;
     this.enableWatch = enableWatch;
+    this.onIndexed = onIndexed;
+    this.onRemoved = onRemoved;
     this.timer = null;
     this.watcher = null;
     this.queued = new Set();
@@ -88,6 +99,7 @@ export class Indexer {
       info = await stat(file);
     } catch {
       this.store.removeFile(file);
+      this.onRemoved(file);
       return 'missing';
     }
     const size = info.size;
@@ -111,6 +123,7 @@ export class Indexer {
       title: decoded.title,
       docs: decoded.docs,
     });
+    this.onIndexed(file);
     return 'indexed';
   }
 
@@ -197,6 +210,7 @@ export class Indexer {
         });
         this.state.indexed += 1;
         this.state.docs += written;
+        this.onIndexed(file);
       } catch (err) {
         this.state.lastError = `${path.basename(file)}: ${String(err?.message ?? err)}`;
       }
@@ -213,6 +227,7 @@ export class Indexer {
         if (seen.has(knownPath)) continue;
         try {
           this.store.removeFile(knownPath);
+          this.onRemoved(knownPath);
           this.state.removed += 1;
         } catch {
           /* 忽略单个文件的清理失败 */

@@ -1,7 +1,7 @@
 {
   "name": "dsh-fast-search",
-  "version": "0.2.1",
-  "description": "会话全文搜索：自建 SQLite FTS5 增量索引，侧栏独立面板，稳态查询 5–15ms；不随每轮对话重建，自带 GitHub Release 在线升级通道。",
+  "version": "0.4.1",
+  "description": "会话全文搜索：自建 SQLite FTS5 增量索引，支持 且/或/括号 组合查询与工作区、时间范围筛选；可选接入独立的 bge 嵌入服务做语义召回（RRF 融合、服务不可达静默降级）；自带 GitHub Release 在线升级通道。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -16,11 +16,11 @@
     "index.js",
     "client.js",
     "update.js",
-    "respawn.cjs",
     "cordis.patch.yml",
     "src",
     "README.md",
     "LICENSE",
+    "docs",
     "CHANGELOG.md"
   ],
   "keywords": [
@@ -30,6 +30,8 @@
     "dsh-plugin",
     "session-search",
     "full-text-search",
+    "semantic-search",
+    "embeddings",
     "sqlite",
     "fts5",
     "self-update"
@@ -50,8 +52,8 @@
     "access": "public"
   },
   "scripts": {
-    "check": "node scripts/check-manifest.mjs && node --check index.js && node --check update.js && node --check client.js && node test/update-smoke.mjs && node test/client-smoke.mjs",
-    "test": "node test/update-smoke.mjs && node test/client-smoke.mjs && node test/verify.mjs",
+    "check": "node scripts/check-manifest.mjs && node --check index.js && node --check update.js && node --check client.js && node --check src/vectors.js && node test/update-smoke.mjs && node test/client-smoke.mjs && node test/vectors-smoke.mjs && node test/query-smoke.mjs && node test/http-smoke.mjs",
+    "test": "node test/update-smoke.mjs && node test/client-smoke.mjs && node test/vectors-smoke.mjs && node test/query-smoke.mjs && node test/http-smoke.mjs && node test/verify.mjs",
     "pack": "npm pack"
   },
   "dsh": {

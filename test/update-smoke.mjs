@@ -129,8 +129,8 @@ const fakeFetch = async (url) => {
       json: async () => ({
         name: PACKAGE_NAME,
         channel: 'stable',
-        latest: '0.3.0',
-        versions: { '0.3.0': { url: 'https://example.test/x.tgz', engines: { dsh: '>=0.2.0' } } },
+        latest: '0.5.0',
+        versions: { '0.5.0': { url: 'https://example.test/x.tgz', engines: { dsh: '>=0.2.0' } } },
       }),
       text: async () => '',
     };
@@ -157,9 +157,9 @@ const handle = createUpdateRoutes(updater);
   assert.equal(res.status, 200);
   const info = res.json;
   assert.equal(info.channel.kind, 'github', '从 release tarball 装的副本应走 GitHub 通道');
-  assert.equal(info.latest, '0.3.0');
+  assert.equal(info.latest, '0.5.0');
   assert.equal(info.current, LOADED_VERSION);
-  assert.equal(info.hasUpdate, true, '0.3.0 应比本机 0.2.0 新');
+  assert.equal(info.hasUpdate, true, '0.5.0 应比本机当前版本新');
   assert.equal(info.installSpec, 'https://example.test/x.tgz', '安装目标取 release 里登记的那个 URL');
   assert.ok(fetchCalls.some((u) => u.endsWith('/releases/latest/download/channel.json')), '主路径是 release 里的 channel.json');
 }
@@ -183,10 +183,8 @@ const handle = createUpdateRoutes(updater);
 }
 
 {
-  const { res } = await call(handle, { method: 'POST', path: '/plugin-api/dsh-fast-search/update/restart' });
-  assert.equal(res.status, 200);
-  assert.equal(res.json.ok, true);
-  assert.ok(['none', 'respawn', 'exit'].includes(res.json.mode), '重启模式必须是这三种之一');
+  const { claimed } = await call(handle, { method: 'POST', path: '/plugin-api/dsh-fast-search/update/restart' });
+  assert.equal(claimed, false, '插件不再提供宿主重启端点');
 }
 
 /* ------------------------------------------------------------------ *
@@ -217,4 +215,4 @@ const handle = createUpdateRoutes(updater);
 updater.dispose();
 rmSync(sandbox, { recursive: true, force: true });
 
-console.log(`update.js 冒烟通过：通道分类、版本比较、range 判定、/ping、/update、缓存、本地拒绝升级（模块版本 ${LOADED_VERSION}）`);
+console.log(`update.js 冒烟通过：通道分类、版本比较、range 判定、/ping、/update、缓存、本地拒绝升级、无重启端点（模块版本 ${LOADED_VERSION}）`);

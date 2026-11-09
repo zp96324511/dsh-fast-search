@@ -1,5 +1,24 @@
 # dsh-fast-search 的加载补丁：把宿主半边插进 composition。
 # 客户端半边由 package.json 的 `dsh.client` 声明，不需在这里列。
+#
+# 语义检索是可选的：不写 config.vectors 就是纯全文检索。
+# 要用自己的嵌入服务时，把下面这段取消注释并填上地址/密钥（详见 README 的配置一节）：
+#
+# - insert:
+#     - id: fast-search
+#       name: dsh-fast-search
+#       config:
+#         search:
+#           mode: auto
+#         vectors:
+#           enabled: true
+#           url: http://127.0.0.1:10450/v1/embeddings
+#           apiKey: ''
+#           model: bge-large
+#           dim: 1024
+#           batch: 8
+#           autoThreshold: 5
+#           minScore: 0.45
 - insert:
     - id: fast-search
       name: dsh-fast-search

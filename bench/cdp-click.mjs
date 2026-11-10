@@ -61,6 +61,8 @@ await evaluate(`(() => {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
   setter.call(input, '调音台');
   input.dispatchEvent(new Event('input', { bubbles: true }));
+  /* 面板只在点「搜索」时检索：输入不再实时触发 */
+  document.querySelector('[data-role="search"] button')?.click();
   return 'typed';
 })()`);
 await sleep(2000);

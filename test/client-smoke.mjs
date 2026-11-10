@@ -318,11 +318,38 @@ const searchIndex = panelChildren.findIndex((node) => node?.props?.['data-role']
 assert.ok(controlsIndex >= 0 && searchIndex >= 0 && controlsIndex < searchIndex,
   '筛选与语义控件应位于搜索框上方');
 
-/* 搜索框后面要真的有搜索按钮，而不是只能靠 160ms 防抖 */
+/* 搜索框后面要真的有搜索按钮；输入本身不再触发检索 */
 const searchRow = panelChildren[searchIndex];
 assert.equal(searchRow.children[1].type, 'button', '搜索框后面要有按钮');
 assert.ok(collectText(searchRow).includes('search'), '搜索按钮要有文案，实际：' + collectText(searchRow));
 assert.equal(searchRow.children[1].props.disabled, false, '有输入内容时搜索按钮可点');
+
+/* 输入只更新草稿：改词后等过旧的 160ms 防抖窗口，也不该自己发 /search */
+const searchInput = searchRow.children[0];
+const searchCalls = () => requests.filter((request) => request.url.includes('/search')).length;
+const beforeTyping = searchCalls();
+searchInput.props.onChange({ target: { value: '新词' } });
+await new Promise((resolve) => setTimeout(resolve, 220));
+assert.equal(searchCalls(), beforeTyping, '输入过程中不应自动触发搜索');
+searchInput.props.onChange({ target: { value: '' } }); /* 复位草稿，避免影响后续渲染 */
+
+/* 只输入、未检索：空态提示下一步动作，而不是误报「没有找到」 */
+slotState = ['新词', '', null, FAKE_STATUS, false, null, 0];
+const typedTree = render(panel);
+const typedText = collectText(typedTree);
+assert.ok(typedText.includes('pressSearch'), '只输入未检索时应提示按 Enter/搜索，实际：' + typedText.slice(0, 200));
+assert.ok(!typedText.includes('emptyFor'), '未检索时不应报「没有找到」');
+
+/* 词改过再按 Enter：先检索新词，不能打开旧结果的第一条 */
+slotState = ['新词', '插件', FAKE_SEARCH, FAKE_STATUS, false, null, 0];
+const dirtyTree = render(panel);
+const dirtyRow = dirtyTree.children.find((node) => node?.props?.['data-role'] === 'search');
+dirtyRow.children[0].props.onKeyDown({ key: 'Enter', preventDefault() {} });
+await new Promise((resolve) => setTimeout(resolve, 20));
+const dirtyRequest = [...requests].reverse().find((request) => request.url.includes('/search'));
+assert.ok(dirtyRequest, '回车应发出搜索请求');
+assert.equal(JSON.parse(dirtyRequest.body).q, '新词', '回车应检索输入框里的新词');
+dirtyRow.children[0].props.onChange({ target: { value: '' } }); /* 复位 memory.text */
 
 /* 自定义时间段：两个原生日期框，选完立即生效 */
 const dateInputs = [...walk(withData)].filter((node) => node.type === 'input' && node.props.type === 'date');
@@ -469,6 +496,6 @@ assert.ok(staleText.includes('restartNeeded'), '要提示需要手动重启');
 assert.ok(![...walk(staleTree)].some((node) => node.type === 'button' && String(node.children.join('')) === 'restart'),
   'stale 状态也不该给重启按钮');
 
-console.log('client.js 冒烟通过：槽注册 2 个、图标尺寸、空态语法提示、控件前置、搜索按钮、日期区间、语义下拉、结果树与高亮结构、升级提示');
+console.log('client.js 冒烟通过：槽注册 2 个、图标尺寸、空态语法提示、控件前置、搜索按钮、输入不自动搜索、回车检索新词、日期区间、语义下拉、结果树与高亮结构、升级提示');
 
 console.log('请求记录：', requests.map((r) => `${r.method} ${r.url}`));

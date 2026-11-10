@@ -2,7 +2,7 @@
  * dsh-fast-search — 浏览器半边。
  *
  * 一个独立的全屏搜索面板（`main` 槽，key = `fast-search`）+ 侧栏放大镜图标。
- * 输入即搜，结果按会话分组，点击任意一条跳进该会话。
+ * 点「搜索」或回车触发检索（输入过程中不发请求），结果按会话分组，点击任意一条跳进该会话。
  *
  * 为什么这样写（都已实测确认）：
  * - 浏览器 bundle 由 dsh-client-modules 发在 `/plugins/<entryId>/client.js`，
@@ -24,7 +24,6 @@ window.__ModuleLoader__.load({
     const PREFIX = '[dsh-fast-search]';
     const PANEL_ID = 'fast-search';
     const API_ROOT = '/plugin-api/dsh-fast-search';
-    const DEBOUNCE_MS = 160;
 
     function log(...args) {
       try {
@@ -40,8 +39,8 @@ window.__ModuleLoader__.load({
         title: '全文搜索',
         placeholder: '搜索所有会话的正文…',
         hint: '输入关键词搜索所有会话正文。\n空格 = 同时包含（A B）；AND / & 也是「且」；OR / | 是「或」；括号可分组：插件 AND (缓存 OR 预热)。\n用引号搜短语："node sqlite"；词尾 * 做前缀：mmap*。中文按字索引，可直接搜「插件」。',
-        empty: '没有找到匹配的会话',
         emptyFor: '没有找到匹配「{q}」的会话',
+        pressSearch: '按 Enter 或点右侧「搜索」开始检索。',
         emptyHint: '可试试更短的词、去掉部分筛选，或用 AND / OR / & / | 重新组合。',
         emptySyntax: '语法：A B（同时包含）· A AND B / A & B · A OR B / A | B · (A OR B) C · "短语" · 前缀*',
         searching: '搜索中…',
@@ -54,7 +53,7 @@ window.__ModuleLoader__.load({
         reindexQueued: '已开始重建，进度见下方',
         reindexHint: '增量对账：只重解大小或修改时间变化的会话文件，不删库',
         search: '搜索',
-        searchHint: '立即搜索（Enter 仍打开第一条结果）',
+        searchHint: '立即搜索（词没改时 Enter 打开第一条结果）',
         customRange: '自定义',
         fromDate: '开始日期',
         toDate: '结束日期',
@@ -124,8 +123,8 @@ window.__ModuleLoader__.load({
         title: 'Full-text search',
         placeholder: 'Search every session…',
         hint: 'Search every session. Space means AND (A B); AND / & also work; OR / | mean OR; group with parentheses: plugins AND (cache OR warmup).\nQuote a phrase: "node sqlite"; trailing * for prefix: mmap*. CJK is indexed per character.',
-        empty: 'No matching session',
         emptyFor: 'No session matches “{q}”',
+        pressSearch: 'Press Enter or click Search to run the query.',
         emptyHint: 'Try shorter terms, loosen filters, or combine them with AND / OR / & / |.',
         emptySyntax: 'Syntax: A B (both) · A AND B / A & B · A OR B / A | B · (A OR B) C · "phrase" · prefix*',
         searching: 'Searching…',
@@ -138,7 +137,7 @@ window.__ModuleLoader__.load({
         reindexQueued: 'Rebuild started',
         reindexHint: 'Incremental reconcile: re-read only files whose size or mtime changed',
         search: 'Search',
-        searchHint: 'Search now (Enter still opens the first hit)',
+        searchHint: 'Search now (Enter opens the first hit when the text is unchanged)',
         customRange: 'Custom',
         fromDate: 'Start date',
         toDate: 'End date',
@@ -852,7 +851,6 @@ window.__ModuleLoader__.load({
       });
       const inputRef = useRef(null);
       const abortRef = useRef(null);
-      const timerRef = useRef(null);
       const seqRef = useRef(0);
 
       /* 升级/重启的计时器放进模块级对象：面板被卸载（去看了会话）也不能把重启轮询带走。 */
@@ -1039,15 +1037,14 @@ window.__ModuleLoader__.load({
           });
       }, []);
 
+      /* 输入只写草稿（text + memory），不发请求：检索只由「搜索」按钮或回车触发。 */
       const onChange = useCallback((event) => {
         const value = event.target.value;
         setText(value);
         memory.text = value;
-        if (timerRef.current) clearTimeout(timerRef.current);
-        timerRef.current = setTimeout(() => runSearch(value), DEBOUNCE_MS);
-      }, [runSearch]);
+      }, []);
 
-      /* 筛选变化立即重跑（不防抖）：下拉和档位点击都是一次性动作。 */
+      /* 筛选变化立即重跑：下拉和档位点击都是一次性动作，不需要再点「搜索」。 */
       const applyFilter = useCallback((patch) => {
         const next = { ...filterRef.current, ...patch };
         filterRef.current = next;
@@ -1061,10 +1058,6 @@ window.__ModuleLoader__.load({
         setFrom(memory.from);
         setTo(memory.to);
         setError(null);
-        if (timerRef.current) {
-          clearTimeout(timerRef.current);
-          timerRef.current = null;
-        }
         if (memory.text.trim() !== '') runSearch(memory.text);
       }, [runSearch]);
 
@@ -1096,7 +1089,6 @@ window.__ModuleLoader__.load({
       }, [applyDates, from]);
 
       useEffect(() => () => {
-        if (timerRef.current) clearTimeout(timerRef.current);
         abortRef.current?.abort?.();
       }, []);
 
@@ -1124,6 +1116,11 @@ window.__ModuleLoader__.load({
       const onKeyDown = useCallback((event) => {
         if (event.key === 'Enter') {
           event.preventDefault();
+          /* 输入框里的词还没搜过（或已改过）：回车先检索，而不是打开旧结果的第一条。 */
+          if (text.trim() !== query) {
+            runSearch(text);
+            return;
+          }
           if (flat.length > 0) openSession(flat[Math.min(active, flat.length - 1)].group.sessionId);
           else runSearch(text);
           return;
@@ -1147,7 +1144,7 @@ window.__ModuleLoader__.load({
             inputRef.current?.blur?.();
           }
         }
-      }, [active, flat, openSession, runSearch, text]);
+      }, [active, flat, openSession, query, runSearch, text]);
 
       const onReindex = useCallback(() => {
         setError(null);
@@ -1376,11 +1373,14 @@ window.__ModuleLoader__.load({
 
       if (flat.length === 0 && error === null) {
         const narrowed = activeFilters.length > 0 ? ` ${t('emptyFiltered')}` : '';
+        /* 只打了字还没点「搜索」：给出下一步动作，而不是假装「没有找到」。 */
         const message = text.trim() === ''
           ? t('hint')
           : (busy
             ? t('searching')
-            : `${query === '' ? t('empty') : t('emptyFor', { q: query })} — ${t('emptyHint')}${narrowed}\n${t('emptySyntax')}`);
+            : (query === ''
+              ? t('pressSearch')
+              : `${t('emptyFor', { q: query })} — ${t('emptyHint')}${narrowed}\n${t('emptySyntax')}`));
         body.push(h('div', { key: 'center', style: ST.center }, message));
       } else {
         let index = 0;

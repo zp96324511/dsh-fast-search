@@ -22,6 +22,54 @@ import { buildSnippet } from './snippet.js';
 /** 库结构版本；改动布局就 +1，旧库会被整体重建（索引可重建，不做迁移）。 */
 export const SCHEMA_VERSION = 1;
 
+/** 会话事件类型（消息类型）的规范值。面板、CLI、HTTP 都按这一份清单筛选。 */
+export const KIND_VALUES = [
+  'user/message',
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+  'session/title',
+  'system/message',
+];
+
+/** 短名与事件全名 → 规范值。认不出的值直接忽略：筛选参数写错不该让搜索失败。 */
+const KIND_ALIASES = new Map([
+  ['user', 'user/message'],
+  ['user/message', 'user/message'],
+  ['assistant', 'assistant/message'],
+  ['assistant/message', 'assistant/message'],
+  ['tool', 'tool/call'],
+  ['tool/call', 'tool/call'],
+  ['tool-call', 'tool/call'],
+  ['call', 'tool/call'],
+  ['result', 'tool/result'],
+  ['tool/result', 'tool/result'],
+  ['tool-result', 'tool/result'],
+  ['title', 'session/title'],
+  ['session/title', 'session/title'],
+  ['system', 'system/message'],
+  ['system/message', 'system/message'],
+]);
+
+/**
+ * 把消息类型参数归一成去重后的规范事件类型。
+ * 数组、逗号/空白分隔的字符串都接受（HTTP 的 `?kinds=user,result` 与 CLI 的 `--kind` 共用）。
+ *
+ * @param {unknown} value
+ * @returns {string[] | null} 空值或全部无法识别 → null（表示不按类型筛选）
+ */
+export function normalizeKinds(value) {
+  if (value === null || value === undefined) return null;
+  const list = Array.isArray(value) ? value : String(value).split(/[,，\s]+/);
+  const out = [];
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const kind = KIND_ALIASES.get(raw.trim().toLowerCase());
+    if (kind !== undefined && !out.includes(kind)) out.push(kind);
+  }
+  return out.length === 0 ? null : out;
+}
+
 const CREATE_SQL = `
 CREATE TABLE IF NOT EXISTS files(
   path        TEXT PRIMARY KEY,
@@ -172,7 +220,7 @@ export class Store {
   }
 
   /**
-   * 动态 SQL 的 prepare 缓存。筛选条件有「工作区 / 起始时间 / 结束时间」三种，
+   * 动态 SQL 的 prepare 缓存。筛选条件有「工作区 / 消息类型 / 起始时间 / 结束时间」四种，
    * 组合出的 SQL 文本稳定，按文本缓存即可。
    * @param {string} sql
    */
@@ -188,12 +236,14 @@ export class Store {
   /**
    * 把请求参数归一成可执行的筛选条件。
    * `workspace` 是 sessions.cwd 的**精确值**（面板从 /workspaces 拿到的原样传回）；
-   * `since` / `until` 是毫秒时间戳，0 表示不设边界。
+   * `since` / `until` 是毫秒时间戳，0 表示不设边界；
+   * `kinds` 是消息类型（会话事件 type）的数组或逗号分隔字符串，空/null 表示全部类型。
    *
-   * @param {{ workspace?: string, since?: number, until?: number }} [options]
-   * @returns {{ workspace: string, sessionIds: string[] | null, since: number, until: number }}
+   * @param {{ workspace?: string, since?: number, until?: number, kinds?: unknown }} [options]
+   * @returns {{ workspace: string, sessionIds: string[] | null, since: number, until: number,
+   *             kinds: string[] | null }}
    */
-  createFilter({ workspace = '', since = 0, until = 0 } = {}) {
+  createFilter({ workspace = '', since = 0, until = 0, kinds = null } = {}) {
     let cwd = typeof workspace === 'string' ? workspace.trim() : '';
     /* 容忍末尾斜杠：`C:\data\projects\` 与 `C:\data\projects` 视为同一个工作区 */
     if (cwd.length > 3) cwd = cwd.replace(/[\\/]+$/, '');
@@ -202,12 +252,14 @@ export class Store {
       : this.st.sessionIdsByCwd.all(cwd).map((row) => row.session_id);
     const from = Number.isFinite(Number(since)) && Number(since) > 0 ? Math.trunc(Number(since)) : 0;
     const to = Number.isFinite(Number(until)) && Number(until) > 0 ? Math.trunc(Number(until)) : 0;
-    return { workspace: cwd, sessionIds, since: from, until: to };
+    return { workspace: cwd, sessionIds, since: from, until: to, kinds: normalizeKinds(kinds) };
   }
 
   /**
    * 筛选条件 → 可出现在 `WHERE` 里的子句与参数（MATCH 之后）。
-   * @param {{ sessionIds: string[] | null, since: number, until: number }} filter
+   * `kind` 是 FTS5 的 UNINDEXED 列，但条件只在已命中的行上求值，不会拖慢 MATCH 本身。
+   * @param {{ sessionIds: string[] | null, since: number, until: number,
+   *           kinds?: string[] | null }} filter
    * @param {any[]} params 追加参数
    * @returns {string[]} 条件片段
    */
@@ -216,6 +268,10 @@ export class Store {
     if (filter.sessionIds !== null) {
       clauses.push('session_id IN (SELECT value FROM json_each(?))');
       params.push(JSON.stringify(filter.sessionIds));
+    }
+    if (Array.isArray(filter.kinds) && filter.kinds.length > 0) {
+      clauses.push('kind IN (SELECT value FROM json_each(?))');
+      params.push(JSON.stringify(filter.kinds));
     }
     if (filter.since > 0) {
       clauses.push('time >= ?');
@@ -232,6 +288,7 @@ export class Store {
   #publicFilter(filter) {
     return {
       workspace: filter.workspace === '' ? null : filter.workspace,
+      kinds: Array.isArray(filter.kinds) && filter.kinds.length > 0 ? filter.kinds : null,
       since: filter.since === 0 ? null : filter.since,
       until: filter.until === 0 ? null : filter.until,
     };
@@ -366,13 +423,17 @@ export class Store {
 
   /**
    * 筛选条件 → 允许参与语义召回的 rowid 集合。`null` 表示不筛选。
-   * 语义召回在打分时就要排除范围外的块，否则 topK 会被别的项目/时间段占满，
+   * 语义召回在打分时就要排除范围外的块，否则 topK 会被别的项目/时间段/类型的块占满，
    * 过滤后反而一条不剩——那是"过滤"而不是"召回"。
-   * @param {{ sessionIds: string[] | null, since: number, until: number }} filter
+   * @param {{ sessionIds: string[] | null, since: number, until: number,
+   *           kinds?: string[] | null }} filter
    * @returns {Set<number> | null}
    */
   ridFilter(filter) {
-    if (filter.sessionIds === null && filter.since === 0 && filter.until === 0) return null;
+    const kinds = Array.isArray(filter.kinds) ? filter.kinds : [];
+    if (filter.sessionIds === null && filter.since === 0 && filter.until === 0 && kinds.length === 0) {
+      return null;
+    }
     const params = [];
     const clauses = this.#filterClauses(filter, params);
     const sql = `SELECT rowid AS rid FROM docs WHERE ${clauses.join(' AND ')}`;
@@ -416,12 +477,12 @@ export class Store {
    * 两阶段查询：①取 bm25 排序后的命中 → ②按会话分组后只对展示的文档取原文、
    * 还原、做窗口高亮。
    *
-   * 筛选在**第一阶段之前**生效（MATCH + 工作区/时间条件同一个查询），所以 total、
+   * 筛选在**第一阶段之前**生效（MATCH + 工作区/消息类型/时间条件同一个查询），所以 total、
    * 分组、截断都以筛选后的结果为准，不会出现"显示 20 个会话、实际全是别的项目"。
    *
    * @param {string} q 用户输入
    * @param {{ limit?: number, groupLimit?: number, perSession?: number, includeTotal?: boolean,
-   *           workspace?: string, since?: number, until?: number,
+   *           workspace?: string, since?: number, until?: number, kinds?: unknown,
    *           filter?: ReturnType<Store['createFilter']> }} [options]
    */
   search(q, options = {}) {

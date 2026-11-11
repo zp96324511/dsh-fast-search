@@ -5,6 +5,7 @@
  *   node cli.mjs build  [--db <文件>] [--sessions <目录>] [--force]
  *   node cli.mjs search <关键词...> [--db <文件>] [--limit 20] [--json]
  *                       [--workspace <cwd>] [--range 1d|1w|1m]
+ *                       [--kind user,assistant,tool,result,title]
  *                       [--since <毫秒|ISO 日期>] [--until <毫秒|ISO 日期>]
  *                       [--semantic off|auto|on] [--top-k 60]
  *                       [--embed-url <url>] [--embed-key <key>] [--embed-model bge-large]
@@ -40,6 +41,7 @@ const VALUE_FLAGS = new Set([
   '--chunk-chars',
   '--batch',
   '--workspace',
+  '--kind',
   '--since',
   '--until',
   '--range',
@@ -144,6 +146,8 @@ if (command === 'build') {
     perSession: 3,
     topK: Number(arg('--top-k', '60')),
     workspace: arg('--workspace', ''),
+    /* 消息类型：短名或事件全名都行，逗号分隔；由 store.createFilter 统一归一 */
+    kinds: arg('--kind', ''),
     since: timestamp(arg('--since', '0')),
     until: timestamp(arg('--until', '0')),
   };

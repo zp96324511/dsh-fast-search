@@ -1,5 +1,25 @@
 # 变更记录
 
+## 0.5.0 — 2026-11-11
+
+**新增「消息类型」筛选。** 除工作区和时间窗，结果还可以按会话事件的 `type` 收窄：
+用户 / 助手 / 工具调用 / 工具结果 / 会话标题；芯片可多选（取并集），不选就是全部类型。
+
+- `src/store.js`：新增 `KIND_VALUES` 与 `normalizeKinds()`——事件全名（`tool/result`）和短名
+  （`user` / `assistant` / `tool` / `result` / `title`）等价，未知值忽略而不是报错；
+  `createFilter` 接受 `kinds`，`#filterClauses` 把它拼进与工作区/时间同一个 `WHERE`，
+  `ridFilter` 同步约束语义召回的候选集，`filters.kinds` 回显规范化后的数组。
+- `src/router.js`：`/search` 接受 `kinds`（数组或逗号/空白分隔字符串）与单值别名 `kind`；
+  `filters.kinds` 回显事件全名，认不出时回 `null`。
+- `client.js`：筛选行新增「类型」芯片组（全部 + 五种类型），切换立即重跑当前查询，
+  选择与工作区/时间一起存 `localStorage`；筛选回显与结果徽标都覆盖 `session/title`
+  （此前落进「记录」）。`system/message` 不做开关——它默认不进索引，摆一个永远 0 条的
+  按钮只会让人怀疑搜索坏了。
+- `cli.mjs`：`search --kind user,assistant,tool,result,title`，别名与 HTTP 同一套归一逻辑。
+- 测试：`query-smoke` 增加类型/别名/组合/`ridFilter` 断言；`http-smoke` 增加数组、单值、
+  未知值与「语义召回受类型约束」；`client-smoke` 增加芯片默认态、多选叠加与请求体断言。
+- 索引结构不变（`kind` 列早已存在于 `docs`），升级**不需要**重建索引。
+
 ## 0.4.4 — 2026-11-10
 
 **搜索改为显式触发。** 面板已经有「搜索」按钮，输入框的实时检索（160ms 防抖）随之移除：

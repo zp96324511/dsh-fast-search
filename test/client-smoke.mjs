@@ -284,7 +284,7 @@ assert.ok(registeredLocales.zh.emptySyntax.includes('A & B') && registeredLocale
  * 渲染面板：有结果（按 Hook 顺序预置 state，跳过异步）
  * ------------------------------------------------------------------ */
 /* SearchPanel 的 state 顺序：text, query, data, status, busy, error, active, update, upd, updError, sem,
- * 之后才是 workspace, range, workspaces（client-smoke 按槽位预置，顺序不能动） */
+ * 之后才是 workspace, range, workspaces, from, to, kinds（client-smoke 按槽位预置，顺序不能动） */
 slotState = ['插件', '插件', FAKE_SEARCH, FAKE_STATUS, false, null, 0];
 const withData = render(panel);
 const rendered = collectText(withData);
@@ -496,6 +496,45 @@ assert.ok(staleText.includes('restartNeeded'), '要提示需要手动重启');
 assert.ok(![...walk(staleTree)].some((node) => node.type === 'button' && String(node.children.join('')) === 'restart'),
   'stale 状态也不该给重启按钮');
 
-console.log('client.js 冒烟通过：槽注册 2 个、图标尺寸、空态语法提示、控件前置、搜索按钮、输入不自动搜索、回车检索新词、日期区间、语义下拉、结果树与高亮结构、升级提示');
+/* 消息类型筛选：默认「全部」，点芯片多选，请求带 kinds 数组 */
+const KIND_CHIPS = ['kindAll', 'kindUser', 'kindAssistant', 'kindTool', 'kindResult', 'kindTitle'];
+const chipByText = (tree, text) => [...walk(tree)].find(
+  (node) => node.type === 'button' && String(node.children.join('')) === text,
+);
+
+slotState = ['', '', null, FAKE_STATUS, false, null, 0, null, 'idle', null, 'auto',
+  '', 'all', FAKE_WORKSPACES.workspaces, '', '', []];
+const kindDefaultTree = render(panel);
+assert.equal([...walk(kindDefaultTree)].filter(
+  (node) => node.type === 'button' && KIND_CHIPS.includes(String(node.children.join(''))),
+).length, 6, '类型筛选要有「全部」+ 五种消息类型');
+assert.equal(chipByText(kindDefaultTree, 'kindAll').props['aria-pressed'], true,
+  '默认不筛类型，落在「全部」');
+assert.equal(chipByText(kindDefaultTree, 'kindResult').props['aria-pressed'], false,
+  '未选中的类型芯片是按下状态 false');
+
+slotState = ['插件', '插件', FAKE_SEARCH, FAKE_STATUS, false, null, 0, null, 'idle', null, 'auto',
+  '', 'all', FAKE_WORKSPACES.workspaces, '', '', ['tool/result']];
+const kindTree = render(panel);
+assert.equal(chipByText(kindTree, 'kindResult').props['aria-pressed'], true,
+  '已选中的类型芯片要按下');
+assert.equal(chipByText(kindTree, 'kindAll').props['aria-pressed'], false);
+assert.ok(collectText(kindTree).includes('filterKinds'), '回显要带上消息类型');
+
+/* 再点「结果」→「用户」= 多选叠加；筛选变化立即重跑，请求体要带 kinds */
+const kindSearchRow = [...walk(kindDefaultTree)].find((node) => node?.props?.['data-role'] === 'search');
+kindSearchRow.children[0].props.onChange({ target: { value: '插件' } });
+chipByText(kindDefaultTree, 'kindResult').props.onClick();
+await new Promise((resolve) => setTimeout(resolve, 20));
+const firstKindRequest = [...requests].reverse().find((request) => request.url.includes('/search'));
+assert.deepEqual(JSON.parse(firstKindRequest.body).kinds, ['tool/result'], '单选一种类型');
+chipByText(kindDefaultTree, 'kindUser').props.onClick();
+await new Promise((resolve) => setTimeout(resolve, 20));
+const kindRequest = [...requests].reverse().find((request) => request.url.includes('/search'));
+assert.ok(kindRequest, '切换类型后要重跑当前查询');
+assert.deepEqual(JSON.parse(kindRequest.body).kinds, ['tool/result', 'user/message'],
+  '类型筛选以数组发给宿主');
+
+console.log('client.js 冒烟通过：槽注册 2 个、图标尺寸、空态语法提示、控件前置、搜索按钮、输入不自动搜索、回车检索新词、日期区间、消息类型筛选、语义下拉、结果树与高亮结构、升级提示');
 
 console.log('请求记录：', requests.map((r) => `${r.method} ${r.url}`));

@@ -1,7 +1,7 @@
 /**
  * 查询语法与筛选的集成冒烟：临时库 + 三条会话，覆盖
  *   空格 AND / 显式 AND·OR / 括号 / 引号短语 / 前缀 / 语法错误降级
- *   工作区（含末尾斜杠与大小写）/ since / until / 组合筛选 / workspaces 列表
+ *   工作区（含末尾斜杠与大小写）/ since / until / 消息类型 / 组合筛选 / workspaces 列表
  *
  * 这里直接打 Store（不经 HTTP），因为筛选最终必须落到 SQL 上——只有真库能证明
  * `total`、分组与截断都受同一个 WHERE 约束。
@@ -71,6 +71,8 @@ try {
     docs: [
       { seq: 1, kind: 'user/message', role: 'user', time: 3_000, text: '插件 索引 重建' },
       { seq: 2, kind: 'assistant/message', role: 'assistant', time: 4_000, text: '索引 缓存 复查' },
+      { seq: 3, kind: 'tool/call', role: 'assistant', time: 3_500, text: '类型 工具调用 参数' },
+      { seq: 4, kind: 'tool/result', role: 'tool', time: 3_600, text: '类型 工具结果 输出' },
     ],
   });
   store.replaceFile('s3.jsonl', {
@@ -80,6 +82,7 @@ try {
     title: 'Alpha 追加',
     docs: [
       { seq: 1, kind: 'user/message', role: 'user', time: 5_000, text: '插件 缓存 索引 三件套' },
+      { seq: 2, kind: 'session/title', role: 'title', time: 5_000, text: '类型 会话标题' },
     ],
   });
 
@@ -134,15 +137,54 @@ try {
 
   const filter = store.createFilter({ workspace: 'C:\\alpha', since: 1_500 });
   const allowed = store.ridFilter(filter);
-  assert.ok(allowed instanceof Set && allowed.size === 2, '语义召回用的 rid 过滤集合');
+  assert.ok(allowed instanceof Set && allowed.size === 3, '语义召回用的 rid 过滤集合');
+
+  /* 消息类型筛选：类型是索引里的会话事件 `type`，与工作区/时间同一层 WHERE */
+  const typed = store.search('类型');
+  assert.equal(typed.total, 3, '工具调用 / 工具结果 / 会话标题各一条');
+  assert.deepEqual(sids(typed), ['s2', 's3']);
+
+  const toolOnly = store.search('类型', { kinds: ['tool/call'] });
+  assert.equal(toolOnly.total, 1, '按消息类型筛选');
+  assert.equal(toolOnly.groups[0].docs[0].kind, 'tool/call');
+  assert.deepEqual(toolOnly.filters.kinds, ['tool/call'], '筛选回显规范化后的类型');
+
+  const resultOnly = store.search('类型', { kinds: 'result' });
+  assert.equal(resultOnly.total, 1, '短名别名等价于 tool/result');
+  assert.equal(resultOnly.groups[0].docs[0].kind, 'tool/result');
+
+  const bothTools = store.search('类型', { kinds: ['tool/call', 'tool/result'] });
+  assert.equal(bothTools.total, 2, '多个类型取并集');
+
+  const titleOnly = store.search('类型', { kinds: 'title' });
+  assert.equal(titleOnly.total, 1, '会话标题也能单独筛');
+  assert.equal(titleOnly.groups[0].docs[0].kind, 'session/title');
+
+  const userOnly = store.search('类型', { kinds: ['user/message'] });
+  assert.equal(userOnly.total, 0, '没有用户消息时类型筛选是真的 0 条');
+
+  const kindAlpha = store.search('类型', { kinds: ['tool/result'], workspace: 'C:\\alpha' });
+  assert.equal(kindAlpha.total, 0, '类型与工作区叠加');
+  const kindBeta = store.search('类型', { kinds: ['tool/result'], workspace: 'C:\\beta' });
+  assert.equal(kindBeta.total, 1);
+
+  const kindUntil = store.search('类型', { kinds: ['tool/result'], until: 3_650 });
+  assert.equal(kindUntil.total, 1, '类型与时间窗叠加');
+
+  const normalized = store.createFilter({ kinds: [' User ', 'result', 'nope', 'tool/result'] });
+  assert.deepEqual(normalized.kinds, ['user/message', 'tool/result'], '别名归一、去重、忽略未知值');
+  assert.equal(store.createFilter({ kinds: [] }).kinds, null, '空数组 = 不筛选');
+
+  const kindRids = store.ridFilter(store.createFilter({ kinds: ['tool/result'] }));
+  assert.ok(kindRids instanceof Set && kindRids.size === 1, '语义召回的 rid 集合也要受类型约束');
 
   const list = store.workspaces();
   assert.deepEqual(list.map((item) => item.cwd), ['C:\\alpha', 'C:\\beta'], '按最近消息倒序');
   assert.deepEqual(list.map((item) => item.sessions), [2, 1]);
-  assert.deepEqual(list.map((item) => item.docs), [3, 2]);
+  assert.deepEqual(list.map((item) => item.docs), [4, 4]);
   assert.equal(list[0].updatedAt, 5_000);
 
-  console.log(`query-smoke ok：${cases.length} 组语法 + 10 组筛选断言`);
+  console.log(`query-smoke ok：${cases.length} 组语法 + 16 组筛选/类型断言`);
 } finally {
   store.close();
   rmSync(root, { recursive: true, force: true });

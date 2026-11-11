@@ -1,6 +1,6 @@
 # dsh-fast-search
 
-DSH Web 的**会话全文搜索**插件：自带 SQLite FTS5 索引，侧栏一个入口，输入后点「搜索」或回车检索，点结果直接跳进那个会话。查询支持 `且/或/括号` 自由组合，结果可以按工作区（项目）和 `1 天 / 1 周 / 1 月` 或自定义日期时间窗筛选。
+DSH Web 的**会话全文搜索**插件：自带 SQLite FTS5 索引，侧栏一个入口，输入后点「搜索」或回车检索，点结果直接跳进那个会话。查询支持 `且/或/括号` 自由组合，结果可以按工作区（项目）、消息类型（用户 / 助手 / 工具 / 结果 / 标题）和 `1 天 / 1 周 / 1 月` 或自定义日期时间窗筛选。
 
 替代官方 `@deepseek-ai/dsh-experimental-session-search`——后者是内存版 MiniSearch，每次启动把 5,400 个会话日志**全量解压重建**，本机实测约 **9.7s**，且只活在进程内存里。本插件把这件事下沉成磁盘索引：首轮建库 36s，之后增量，单次查询 **2–25ms**。
 
@@ -71,8 +71,9 @@ New-Item -ItemType Junction `
 
 - 侧栏 **🔍 全文搜索**（在「正在活跃」下面），点开是独立面板。
 - 输入过程中不发请求；点搜索框右侧的「搜索」按钮或按 `Enter` 检索。词没改时 `Enter` 打开第一条命中（改过词则先搜新词），`↑ ↓` 在命中间移动，`Esc` 清空。
-- 结果按会话分组：会话标题 + 工作区 + 相对时间，每条命中带类型徽标（用户 / 助手 / 工具 / 结果）和高亮片段。
-- 搜索框上面一行是筛选：工作区下拉（带会话数）+ `全部 / 1 天 / 1 周 / 1 月` 快捷档 + 自定义起止日期；选择记在
+- 结果按会话分组：会话标题 + 工作区 + 相对时间，每条命中带类型徽标（用户 / 助手 / 工具 / 结果 / 标题）和高亮片段。
+- 搜索框上面一行是筛选：工作区下拉（带会话数）+ 消息类型芯片（全部 / 用户 / 助手 / 工具 / 结果 / 标题，可多选）
+  + `全部 / 1 天 / 1 周 / 1 月` 快捷档 + 自定义起止日期；选择记在
   `localStorage`，刷新和重开面板都保持；切换后立即重跑当前查询。
 - 点会话标题或任一命中 → 跳到该会话（`uiWorkspace.openSession`）。
 
@@ -98,9 +99,10 @@ New-Item -ItemType Junction `
 | 筛选 | 行为 |
 |---|---|
 | 工作区 | 精确匹配会话的 `cwd`（Windows 盘符/路径大小写不敏感，末尾斜杠会被忽略）；下拉列表来自 `GET /workspaces`，按最近一条消息倒序 |
+| 消息类型 | 按会话事件的 `type` 过滤：用户 `user/message`、助手 `assistant/message`、工具调用 `tool/call`、工具结果 `tool/result`、会话标题 `session/title`。芯片可多选（取并集），不选 = 全部类型 |
 | `1 天 / 1 周 / 1 月` | 按**消息时间**过滤（不是会话创建时间），`1 月` 固定 30 天；时间窗由宿主按「现在」换算，所以放一晚上再打开仍是「近 1 天」 |
 | 自定义日期 | 选择起止日期（本地时区，含首尾两天）；只填一端就是开放区间，和快捷档一样按消息时间过滤 |
-| 组合 | 工作区与时间窗可叠加；`total`、会话分组、语义召回都受同一组条件约束 |
+| 组合 | 工作区、消息类型与时间窗可叠加；`total`、会话分组、语义召回都受同一组条件约束 |
 
 筛选只影响结果，不改索引；切换筛选不需要重建库。
 
@@ -190,7 +192,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 |---|---|
 | `GET /status` | `{ version, sessionsDir, dbPath, dbBytes, docs, sessions, files, searchMode, index: { phase, done, total, indexed, skipped, removed, lastError }, vectors: { enabled, ready, paused, model, dim, chunks, bytes, docsCovered, docsTotal, progress: { phase, chunks, chunksTotal, chars, charsTotal, rate, etaMs }, lastError } }` |
 | `GET /workspaces` | `{ workspaces: [{ cwd, sessions, docs, updatedAt }] }`，按 `updatedAt`（该工作区最近一条消息）倒序 |
-| `GET\|POST /search` | 入参 `q`（必填）、`limit`（≤300）、`groupLimit`、`perSession`、`includeTotal`、`semantic`（`off`/`auto`/`on`，也接受 `true`/`false`）；筛选 `workspace`（cwd 原值）、`since`/`until`（毫秒或 ISO 日期）、`range`（`1d`/`1w`/`1m`，也接受 `day`/`week`/`month` 等别名） |
+| `GET\|POST /search` | 入参 `q`（必填）、`limit`（≤300）、`groupLimit`、`perSession`、`includeTotal`、`semantic`（`off`/`auto`/`on`，也接受 `true`/`false`）；筛选 `workspace`（cwd 原值）、`kinds`（消息类型数组或逗号分隔字符串，也接受单值别名 `kind`；值可用事件全名或短名 `user`/`assistant`/`tool`/`result`/`title`）、`since`/`until`（毫秒或 ISO 日期）、`range`（`1d`/`1w`/`1m`，也接受 `day`/`week`/`month` 等别名） |
 | `POST /reindex` | 触发全量对账（`force=true` 时整库重建），异步，进度看 `/status` |
 | `GET /vectors` | 语义索引状态（同 `/status` 里的 `vectors`） |
 | `POST /vectors/sync` | 触发一轮建库，`{ force, maxChars }`，202 立即返回；进度看 `/vectors` |
@@ -205,11 +207,12 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 ```json
 { "q": "插件 OR 缓存", "match": "\"插 件\" OR \"缓 存\"", "terms": ["插件", "缓存"],
   "words": ["插件", "缓存"], "syntax": "boolean", "parseError": null,
-  "filters": { "workspace": "C:\\data\\projects\\dsh-fast-search", "since": 1793…, "until": null, "range": "1w" },
+  "filters": { "workspace": "C:\\data\\projects\\dsh-fast-search", "kinds": ["user/message", "tool/result"],
+               "since": 1793…, "until": null, "range": "1w" },
   "took": 16.1, "total": 872, "truncated": true,
   "groups": [{ "sessionId": "session-…", "title": "…", "cwd": "…", "createdAt": 1793…,
                "lastTime": 1793…,
-               "docs": [{ "seq": 42, "kind": "assistant", "role": "assistant", "time": 1793…,
+               "docs": [{ "seq": 42, "kind": "assistant/message", "role": "assistant", "time": 1793…,
                           "snippet": [{ "text": "这个", "mark": false }, { "text": "插件", "mark": true }],
                           "matched": 2, "source": "fts", "score": 0.0164 }] }],
   "semantic": { "used": true, "mode": "auto", "model": "bge-large", "hits": 42, "shown": 3,
@@ -294,6 +297,8 @@ git push origin main --tags
 node cli.mjs build  --db .tmp\test.db --sessions C:\Users\win10\.dsh\sessions --force
 node cli.mjs search --db .tmp\test.db "插件" --limit 10
 node cli.mjs search --db .tmp\test.db "插件 OR 缓存" --workspace "C:\data\projects\dsh-fast-search" --range 1w
+node cli.mjs search --db .tmp\test.db "插件" --kind user,assistant --limit 10
+node cli.mjs search --db .tmp\test.db "工具" --kind tool,result --json
 node cli.mjs search --db .tmp\test.db "让搜索更快" --semantic on --embed-url http://127.0.0.1:10450/v1/embeddings
 node cli.mjs vectors status --db .tmp\test.db --embed-url http://127.0.0.1:10450/v1/embeddings
 node cli.mjs vectors sync   --db .tmp\test.db --chars 20000 --embed-url http://127.0.0.1:10450/v1/embeddings
@@ -309,8 +314,8 @@ npm run check                # 清单自检 + 语法 + 五个冒烟测试（CI �
 node test\update-smoke.mjs   # 升级通道：通道分类、版本比较、HTTP 语义、本地副本拒绝升级
 node test\client-smoke.mjs   # 不装宿主：工厂 → apply → 槽注册 → 筛选行 → 渲染（自带 React 桩）
 node test\vectors-smoke.mjs  # 语义链路：切块不变量、跨词召回、融合、重启免重建、增量、换模型作废
-node test\query-smoke.mjs    # 查询语法 + 工作区/时间筛选：真 FTS 库上的 17 组语法与 10 组筛选断言
-node test\http-smoke.mjs     # 真 HTTP：/status、/search 筛选与语义、/workspaces、/vectors*、409
+node test\query-smoke.mjs    # 查询语法 + 工作区/时间/消息类型筛选：真 FTS 库上的 17 组语法与 16 组筛选断言
+node test\http-smoke.mjs     # 真 HTTP：/status、/search 筛选（工作区/时间/类型）与语义、/workspaces、/vectors*、409
 node test\verify.mjs         # 建库 + 召回真值对照（FTS 计数 vs 全表字面扫描）+ 往返一致性
 node bench\cdp-verify.mjs 9222 插件   # 真浏览器端到端：bundle 加载、点图标、搜出结果、截图
 node bench\cdp-click.mjs   9222      # 点结果跳会话 + 回来恢复上次查询
@@ -327,7 +332,9 @@ node bench\cdp-click.mjs   9222      # 点结果跳会话 + 回来恢复上次�
 - **只搜已落盘的会话**：日志由宿主追加写入，`fs.watch` 250ms 防抖后会补进索引，正在进行的会话可能有几百毫秒延迟。
 - **布尔语法没有 NOT**：本版只做 `AND` / `OR` / 括号；运算符必须空格隔开，`插件或缓存` 是一个词而不是 OR。
 - **筛选是精确工作区**：`workspace` 按 `sessions.cwd` 原值匹配（不递归子目录）；时间筛选按消息 `time`，缺少时间的历史文档在 `since` 下会被排除。
-- **筛选不进语义索引**：语义召回在打分阶段按筛选后的 rowid 候选过滤，不会跨工作区/时间段召回；这不需要重建向量库。
+- **筛选不进语义索引**：语义召回在打分阶段按筛选后的 rowid 候选过滤，不会跨工作区/时间段/消息类型召回；这不需要重建向量库。
+- **语义索引默认只嵌三类消息**：`vectors.kinds` 默认 `user/message, assistant/message, session/title`；
+  只筛「工具 / 结果」时全文照常命中，但那两类块没有向量，语义补召为空。
 - **升级必须手动重启一次**：宿主侧代码（`index.js` / `src/*.js` / `update.js`）不参与 HMR；面板只提示，不提供也不执行宿主重启。
 - **语义模式比全文慢一个数量级**：每次要等嵌入服务回一个查询向量，实测 60–210ms（冷查询更久），
   所以它不进快路径，`auto` 也只在全文稀疏时才触发。
@@ -353,4 +360,4 @@ node bench\cdp-click.mjs   9222      # 点结果跳会话 + 回来恢复上次�
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。最近一次：**0.4.2** — 明确 Node.js 22.13+ 运行要求（`node:sqlite`），CI 覆盖 22/24/26；功能与 0.4.1 相同。
+见 [CHANGELOG.md](CHANGELOG.md)。最近一次：**0.5.0** — 新增「消息类型」筛选（用户 / 助手 / 工具 / 结果 / 标题，可多选），索引结构不变。

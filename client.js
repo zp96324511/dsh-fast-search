@@ -72,6 +72,7 @@ window.__ModuleLoader__.load({
         kindTool: '工具',
         kindResult: '结果',
         kindSystem: '系统',
+        kindTitle: '标题',
         kindOther: '记录',
         version: 'v{v}',
         checking: '检查更新…',
@@ -106,10 +107,14 @@ window.__ModuleLoader__.load({
         rangeDay: '1 天',
         rangeWeek: '1 周',
         rangeMonth: '1 月',
-        filterHint: '按工作区或时间范围缩小结果',
+        filterHint: '按工作区、消息类型或时间范围缩小结果',
         filterNote: '筛选：{filters}',
         filterWorkspace: '工作区 {name}',
         filterRange: '近 {label}',
+        filterKinds: '类型 {names}',
+        messageTypeLabel: '类型',
+        kindHint: '按消息类型筛选：可多选，不选就是全部类型',
+        kindAll: '全部',
         workspaceMissing: '（不在索引中）',
         emptyFiltered: '筛选条件可能过窄',
         syntaxError: '语法提示：{detail}，已按全部关键词同时命中处理',
@@ -156,6 +161,7 @@ window.__ModuleLoader__.load({
         kindTool: 'Tool',
         kindResult: 'Result',
         kindSystem: 'System',
+        kindTitle: 'Title',
         kindOther: 'Event',
         version: 'v{v}',
         checking: 'Checking for updates…',
@@ -190,10 +196,14 @@ window.__ModuleLoader__.load({
         rangeDay: '1 day',
         rangeWeek: '1 week',
         rangeMonth: '1 month',
-        filterHint: 'Narrow results by workspace or time range',
+        filterHint: 'Narrow results by workspace, message type or time range',
         filterNote: 'Filter: {filters}',
         filterWorkspace: 'workspace {name}',
         filterRange: 'last {label}',
+        filterKinds: 'type {names}',
+        messageTypeLabel: 'Type',
+        kindHint: 'Filter by message type: select any number, none means all',
+        kindAll: 'All',
         workspaceMissing: ' (not indexed)',
         emptyFiltered: 'the filters may be too narrow',
         syntaxError: 'Query syntax: {detail}; searched all terms instead',
@@ -309,6 +319,7 @@ window.__ModuleLoader__.load({
       'tool/call': 'kindTool',
       'tool/result': 'kindResult',
       'system/message': 'kindSystem',
+      'session/title': 'kindTitle',
     };
 
     function kindLabel(kind) {
@@ -714,7 +725,7 @@ window.__ModuleLoader__.load({
      * 面板被结果点击抢走焦点后会被卸载（`main` 槽切到会话视图），
      * 再次打开时用它恢复上一次的查询并自动重跑，避免用户重新输入。
      */
-    const memory = { text: '', workspace: '', range: 'all', from: '', to: '' };
+    const memory = { text: '', workspace: '', range: 'all', from: '', to: '', kinds: [] };
 
     /* 语义模式是**用户的选择**，不是面板的临时状态：记在 localStorage，刷新与重开都保持。
      * 默认 auto——只在全文稀疏时才补向量，日常查询不受语义索引的延迟影响。 */
@@ -744,6 +755,17 @@ window.__ModuleLoader__.load({
       { value: '1m', key: 'rangeMonth' },
     ];
     const RANGE_VALUES = new Set([...RANGE_OPTIONS.map((option) => option.value), 'custom']);
+    /* 消息类型筛选：值与索引里的会话事件 `type` 一一对应，顺序就是面板上的顺序。
+     * `system/message` 默认不进索引（见 decode.js），所以不给它做开关——摆一个永远
+     * 返回 0 条的按钮比不摆更让人困惑。 */
+    const KIND_OPTIONS = [
+      { kind: 'user/message', key: 'kindUser' },
+      { kind: 'assistant/message', key: 'kindAssistant' },
+      { kind: 'tool/call', key: 'kindTool' },
+      { kind: 'tool/result', key: 'kindResult' },
+      { kind: 'session/title', key: 'kindTitle' },
+    ];
+    const KIND_VALUES = new Set(KIND_OPTIONS.map((option) => option.kind));
     function loadFilters() {
       try {
         const saved = JSON.parse(localStorage.getItem(FILTER_KEY) ?? 'null');
@@ -756,14 +778,18 @@ window.__ModuleLoader__.load({
           to = '';
           range = 'all';
         }
+        const kinds = Array.isArray(saved?.kinds)
+          ? [...new Set(saved.kinds.filter((kind) => KIND_VALUES.has(kind)))]
+          : [];
         return {
           workspace: typeof saved?.workspace === 'string' ? saved.workspace : '',
           range,
           from: range === 'custom' ? from : '',
           to: range === 'custom' ? to : '',
+          kinds,
         };
       } catch {
-        return { workspace: '', range: 'all', from: '', to: '' };
+        return { workspace: '', range: 'all', from: '', to: '', kinds: [] };
       }
     }
     function saveFilters() {
@@ -773,6 +799,7 @@ window.__ModuleLoader__.load({
           range: memory.range,
           from: memory.from,
           to: memory.to,
+          kinds: memory.kinds,
         }));
       } catch { /* 存不下就只活这一次 */ }
     }
@@ -781,6 +808,7 @@ window.__ModuleLoader__.load({
     memory.range = savedFilters.range;
     memory.from = savedFilters.from;
     memory.to = savedFilters.to;
+    memory.kinds = savedFilters.kinds;
 
     function openSessionById(sessionId) {
       if (typeof sessionId !== 'string' || sessionId === '') return;
@@ -843,11 +871,13 @@ window.__ModuleLoader__.load({
       const [workspaces, setWorkspaces] = useState([]);
       const [from, setFrom] = useState(memory.from);
       const [to, setTo] = useState(memory.to);
+      const [kinds, setKinds] = useState(memory.kinds);
       const filterRef = useRef({
         workspace: memory.workspace,
         range: memory.range,
         from: memory.from,
         to: memory.to,
+        kinds: memory.kinds,
       });
       const inputRef = useRef(null);
       const abortRef = useRef(null);
@@ -1011,6 +1041,7 @@ window.__ModuleLoader__.load({
         const filter = filterRef.current;
         const payload = { q: next, limit: 300, semantic: semRef.current };
         if (filter.workspace !== '') payload.workspace = filter.workspace;
+        if (Array.isArray(filter.kinds) && filter.kinds.length > 0) payload.kinds = filter.kinds;
         if (filter.range === 'custom') {
           /* 自定义日期是绝对区间：按本地日界换算成毫秒，空的一端保持开区间 */
           const since = dayStart(filter.from);
@@ -1044,7 +1075,7 @@ window.__ModuleLoader__.load({
         memory.text = value;
       }, []);
 
-      /* 筛选变化立即重跑：下拉和档位点击都是一次性动作，不需要再点「搜索」。 */
+      /* 筛选变化立即重跑：下拉、档位和类型开关都是一次性动作，不需要再点「搜索」。 */
       const applyFilter = useCallback((patch) => {
         const next = { ...filterRef.current, ...patch };
         filterRef.current = next;
@@ -1052,14 +1083,25 @@ window.__ModuleLoader__.load({
         memory.range = next.range;
         memory.from = next.from ?? '';
         memory.to = next.to ?? '';
+        memory.kinds = Array.isArray(next.kinds) ? next.kinds : [];
         saveFilters();
         setWorkspace(next.workspace);
         setRange(next.range);
         setFrom(memory.from);
         setTo(memory.to);
+        setKinds(memory.kinds);
         setError(null);
         if (memory.text.trim() !== '') runSearch(memory.text);
       }, [runSearch]);
+
+      /* 类型开关是多选：点一下加入/移出，`''` 表示清空回「全部类型」。 */
+      const toggleKind = useCallback((kind) => {
+        const current = Array.isArray(filterRef.current.kinds) ? filterRef.current.kinds : [];
+        const next = kind === ''
+          ? []
+          : (current.includes(kind) ? current.filter((item) => item !== kind) : [...current, kind]);
+        applyFilter({ kinds: next });
+      }, [applyFilter]);
 
       /* 日期输入即生效：只选一端就是开区间；两端倒置时先报错、不拿坏区间去搜。 */
       const applyDates = useCallback((nextFrom, nextTo) => {
@@ -1196,6 +1238,12 @@ window.__ModuleLoader__.load({
       /* 筛选回显：让用户一眼看出「为什么结果这么少」，而不是怀疑搜索坏了。 */
       const activeFilters = [];
       if (workspace !== '') activeFilters.push(t('filterWorkspace', { name: cwdTail(workspace) }));
+      if (kinds.length > 0) {
+        const names = KIND_OPTIONS
+          .filter((option) => kinds.includes(option.kind))
+          .map((option) => t(option.key));
+        activeFilters.push(t('filterKinds', { names: names.join(' + ') }));
+      }
       if (range === 'custom' && (from !== '' || to !== '')) {
         const label = from !== '' && to !== ''
           ? t('customSpan', { from, to })
@@ -1290,6 +1338,24 @@ window.__ModuleLoader__.load({
             title: item.cwd,
             style: optionStyle,
           }, workspaceName(item)))),
+        /* 消息类型：多选 chip，与时间档位同一套视觉；「全部」清空选择。 */
+        h('span', { style: { ...ST.filterLabel, marginLeft: 6 } }, t('messageTypeLabel')),
+        h('button', {
+          key: 'kind:all',
+          type: 'button',
+          style: kinds.length === 0 ? ST.chipHot : ST.chip,
+          title: t('kindHint'),
+          'aria-pressed': kinds.length === 0,
+          onClick: () => toggleKind(''),
+        }, t('kindAll')),
+        KIND_OPTIONS.map((option) => h('button', {
+          key: `kind:${option.kind}`,
+          type: 'button',
+          style: kinds.includes(option.kind) ? ST.chipHot : ST.chip,
+          title: t('kindHint'),
+          'aria-pressed': kinds.includes(option.kind),
+          onClick: () => toggleKind(option.kind),
+        }, t(option.key))),
         h('span', { style: { ...ST.filterLabel, marginLeft: 6 } }, t('rangeLabel')),
         RANGE_OPTIONS.map((option) => h('button', {
           key: option.value,

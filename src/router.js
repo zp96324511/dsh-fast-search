@@ -11,6 +11,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { normalizeKinds } from './store.js';
 import { searchWithSemantic } from './search.js';
 
 const MAX_BODY = 256 * 1024;
@@ -124,6 +125,7 @@ export function createHandler({
         const filter = normalizeFilter(input);
         const filterInfo = {
           workspace: filter.workspace === '' ? null : filter.workspace,
+          kinds: filter.kinds,
           since: filter.since === 0 ? null : filter.since,
           until: filter.until === 0 ? null : filter.until,
           range: filter.range === '' ? null : filter.range,
@@ -143,6 +145,7 @@ export function createHandler({
             groupLimit: clampInt(input.groupLimit, 1, 100, 20),
             perSession: clampInt(input.perSession, 1, 50, 6),
             workspace: filter.workspace,
+            kinds: filter.kinds,
             since: filter.since,
             until: filter.until,
           },
@@ -234,8 +237,10 @@ function toTimestamp(value) {
 /**
  * /search 的筛选参数归一化。`range` 是相对现在的时间窗；显式 `since` 与 `range`
  * 同时给时取更严格的那个（`since = max(since, now-range)`）。
+ * `kinds` 是消息类型（会话事件 type）：数组，或逗号/空白分隔字符串；短名会归一成事件全名。
  * @param {Record<string, unknown>} input
- * @returns {{ workspace: string, since: number, until: number, range: string }}
+ * @returns {{ workspace: string, since: number, until: number, range: string,
+ *             kinds: string[] | null }}
  */
 function normalizeFilter(input) {
   const workspace =
@@ -248,7 +253,9 @@ function normalizeFilter(input) {
     const fromRange = Date.now() - rangeMs;
     since = since > 0 ? Math.max(since, fromRange) : fromRange;
   }
-  return { workspace, since, until, range: rangeMs > 0 ? range : '' };
+  /* `kind` 是 `kinds` 的单值别名（GET 里更顺手）；两个都给时以 `kinds` 为准 */
+  const kinds = normalizeKinds(input.kinds ?? input.kind);
+  return { workspace, since, until, range: rangeMs > 0 ? range : '', kinds };
 }
 
 /**

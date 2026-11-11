@@ -264,6 +264,62 @@ await check('/search 时间范围：since / until / range 快捷档', async () =
   assert.ok(range.json.filters.since > 0);
 });
 
+await check('/search 按消息类型筛选（数组 / 短名别名 / 与工作区叠加）', async () => {
+  const users = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '缓存', kinds: ['user/message'], semantic: 'off' }),
+  });
+  assert.equal(users.status, 200);
+  assert.equal(users.json.total, 2, '两个会话各一条用户消息');
+  assert.deepEqual(users.json.filters.kinds, ['user/message']);
+  for (const group of users.json.groups) {
+    for (const doc of group.docs) assert.equal(doc.kind, 'user/message');
+  }
+
+  /* 单值别名 `kind`、短名 `assistant`：都归一成事件全名再回显 */
+  const assistants = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '缓存', kind: 'assistant', semantic: 'off' }),
+  });
+  assert.equal(assistants.json.total, 0, '助手那条不含「缓存」');
+  assert.deepEqual(assistants.json.filters.kinds, ['assistant/message']);
+
+  const work = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '缓存', kinds: 'user', workspace: 'C:\\work', semantic: 'off' }),
+  });
+  assert.equal(work.json.total, 1, '类型与工作区叠加');
+  assert.equal(work.json.groups[0].sessionId, 'session-http');
+
+  /* 认不出的类型不该让搜索失败：整条条件被忽略，结果与不筛选一致 */
+  const bogus = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '缓存', kinds: ['bogus'], semantic: 'off' }),
+  });
+  assert.equal(bogus.status, 200);
+  assert.equal(bogus.json.total, 2);
+  assert.equal(bogus.json.filters.kinds, null);
+});
+
+await check('/search 语义召回也受消息类型约束', async () => {
+  const res = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '加速', kinds: ['user/message'], semantic: 'on' }),
+  });
+  assert.equal(res.json.semantic.used, true, '用户消息里仍有语义命中');
+  assert.ok(res.json.groups.length > 0);
+  for (const group of res.json.groups) {
+    for (const doc of group.docs) assert.equal(doc.kind, 'user/message');
+  }
+
+  const assistantOnly = await call('/search', {
+    method: 'POST',
+    body: JSON.stringify({ q: '加速', kinds: ['assistant/message'], semantic: 'on' }),
+  });
+  assert.equal(assistantOnly.json.semantic.used, false, '只剩助手消息时没有相关块');
+  assert.equal(assistantOnly.json.semantic.reason, 'no-match');
+});
+
 await check('/search 语义召回也受工作区约束（打分前过滤）', async () => {
   const res = await call('/search', {
     method: 'POST',

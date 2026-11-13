@@ -1,5 +1,33 @@
 # 变更记录
 
+## 0.6.0 — 2026-11-13
+
+**建库提速约 3.5×：内容级向量复用 + 并发请求 + 向量表去重存储。**
+
+三件事是叠加的：同一段文本只嵌一次（实测省掉 49% 的字符量）、请求改成 N 路并行
+（2 路实测 1.9×）、存储从「每行一份向量」改成「一份内容 + 多条引用」。5.09M 字符的全量建库
+从约 42 分钟降到约 12 分钟。
+
+- `src/store.js`：向量表拆成 `vec_content(hash PK, scale, vec)` + `vec_refs(path, hash, chunk_ix,
+  rid, start, len)`，新增 `vec_refs_hash` 索引；`migrateVectorSchema()` 在打开库时把 0.5.x 的
+  `vec_chunks` 一次性迁过去（同 hash 只留一份）并删旧表——**不重建全文索引、不重新嵌入**。
+  `SCHEMA_VERSION` 升到 2，但迁移是就地完成的，旧库不会整体重建。
+- `src/vectors.js`：`VectorStore` 改为按唯一内容分配内存槽位（`hashes` / `hashSlots` /
+  `refsByHash`），`search()` 每份内容只算一次点积，命中后再从引用里挑一条满足筛选的位置；
+  `insertMany()` 对已有内容只写引用、不再要求传向量。
+- `src/vectors.js`：扫描阶段跨文件按 hash 分组，库里已有的内容直接补引用（`progress.reused`），
+  只把真正的新内容送去嵌入；`progress.charsTotal` 改为「去重后待嵌字符」，ETA 因此变准。
+- `src/embed.js`：`Embedder` 新增 `concurrency`（默认 1，上限 4）。`embedTexts()` 按 `batch`
+  切片后由 N 条 lane 并行请求，结果按下标回填，顺序与输入严格一致；任一路失败即整批失败。
+- 配置新增 `vectors.concurrency`；`batch` 建议回到 8（实测 8→64 总吞吐不变，只是拉长单请求）。
+  CLI 增加 `--concurrency`。
+- `/vectors` 与 `/status` 增加 `contents`、`batch`、`concurrency`、`progress.reused`。
+- 实测（2026-11-13，硬件升级后的 bge 服务，48 个真实块 / 21,529 字符）：串行 2.0k 字符/秒；
+  2 路 3.9k（1.9×）；4 路 3.6–3.8k（无增益）；8 路 HTTP 502。批大小 8/16/32/64 的串行吞吐一致。
+  服务端没有文本级缓存，所以内容去重的收益是真实的。
+- 测试：`vectors-smoke` 增加「跨文件只嵌一次」「第三场会话零嵌入调用」「删一条引用不误删内容」
+  「concurrency=2 并行且顺序正确」「concurrency=1 严格串行」「0.5.x 老库自动迁移」六组断言。
+
 ## 0.5.0 — 2026-11-11
 
 **新增「消息类型」筛选。** 除工作区和时间窗，结果还可以按会话事件的 `type` 收窄：

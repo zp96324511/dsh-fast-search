@@ -10,7 +10,7 @@
  *                       [--semantic off|auto|on] [--top-k 60]
  *                       [--embed-url <url>] [--embed-key <key>] [--embed-model bge-large]
  *   node cli.mjs vectors status|sync [--db <文件>] [--sessions <目录>] [--force]
- *                       [--chars N] [--chunk-chars 480] [--batch 8]
+ *                       [--chars N] [--chunk-chars 480] [--batch 8] [--concurrency 1]
  *                       [--embed-url <url>] [--embed-key <key>] [--embed-model bge-large]
  *   node cli.mjs status [--db <文件>]
  *
@@ -40,6 +40,7 @@ const VALUE_FLAGS = new Set([
   '--chars',
   '--chunk-chars',
   '--batch',
+  '--concurrency',
   '--workspace',
   '--kind',
   '--since',
@@ -107,7 +108,8 @@ function rangeSince(value) {
   return ms > 0 ? Date.now() - ms : 0;
 }
 
-/** @returns {{ enabled: boolean, url: string, model: string, apiKey: string, chunkChars: number, batch: number }} */
+/** @returns {{ enabled: boolean, url: string, model: string, apiKey: string, chunkChars: number,
+ *             batch: number, concurrency: number }} */
 function vectorConfig() {
   const url = arg('--embed-url', process.env.DSH_EMBED_URL ?? '');
   return {
@@ -117,6 +119,7 @@ function vectorConfig() {
     apiKey: arg('--embed-key', process.env.DSH_EMBED_KEY ?? ''),
     chunkChars: Number(arg('--chunk-chars', '480')),
     batch: Number(arg('--batch', '8')),
+    concurrency: Number(arg('--concurrency', '1')),
   };
 }
 

@@ -53,17 +53,29 @@ function fakeVector(text) {
 }
 
 class FakeEmbedder {
-  constructor() {
+  constructor({ delayMs = 0 } = {}) {
     this.calls = 0;
     this.texts = 0;
+    this.delayMs = delayMs;
+    this.inFlight = 0;
+    this.maxInFlight = 0;
+    this.seen = [];
     this.stats = { calls: 0, texts: 0 };
   }
 
   async embedTexts(texts) {
     this.calls += 1;
     this.texts += texts.length;
-    this.stats = { calls: this.calls, texts: this.texts };
-    return texts.map((text) => fakeVector(text));
+    this.seen.push(...texts);
+    this.inFlight += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    try {
+      if (this.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      this.stats = { calls: this.calls, texts: this.texts };
+      return texts.map((text) => fakeVector(text));
+    } finally {
+      this.inFlight -= 1;
+    }
   }
 
   async embedOne(text) {
@@ -317,6 +329,190 @@ await checkAsync('删文件后不再出现在语义结果里', async () => {
     0,
     '已删会话仍被召回',
   );
+});
+
+/* ── 3.5 内容去重（跨文件复用同一份向量）─────────────────── */
+process.stdout.write('内容去重\n');
+
+const fileC = path.join(root, 'c.jsonl.zstd');
+const fileD = path.join(root, 'd.jsonl.zstd');
+const shared = '这是一段会在多场会话里原样重复出现的注入上下文，用来验证跨文件复用向量';
+store2.replaceFile(fileC, {
+  size: 100,
+  mtimeMs: 4000,
+  header: { ...header, id: 'session-c' },
+  title: '重复 A',
+  docs: [
+    { seq: 1, kind: 'user/message', role: 'user', time: 5000, text: shared },
+    { seq: 2, kind: 'user/message', role: 'user', time: 5001, text: '只有 c 才有的独有内容' },
+  ],
+});
+store2.replaceFile(fileD, {
+  size: 100,
+  mtimeMs: 5000,
+  header: { ...header, id: 'session-d' },
+  title: '重复 B',
+  docs: [{ seq: 1, kind: 'user/message', role: 'user', time: 6000, text: shared }],
+});
+
+await checkAsync('同一段文本在多场会话里只嵌入一次，引用各存一条', async () => {
+  const beforeTexts = embedder2.texts;
+  const beforeContents = engine2.vs.liveContent;
+  const result = await engine2.sync({ paths: [fileC, fileD] });
+  /* 3 条引用（c 的 2 块 + d 的 1 块），但只有 2 份**新增**唯一内容：
+   * shared 与 c 独有的那块。关键断言是 shared 只被嵌入一次，向量扇出到两场会话。 */
+  assert.equal(result.chunks, 3, `写入引用 ${result.chunks}`);
+  const embeddedTexts = embedder2.seen.slice(beforeTexts);
+  assert.equal(
+    embeddedTexts.filter((text) => text === shared).length,
+    1,
+    `shared 被嵌入了 ${embeddedTexts.filter((text) => text === shared).length} 次`,
+  );
+  assert.equal(engine2.vs.liveContent - beforeContents, 2, `新增唯一内容 ${engine2.vs.liveContent - beforeContents}`);
+  assert.ok(engine2.vs.live > engine2.vs.liveContent, '引用数应多于内容数');
+  const refs = store2.db.prepare('SELECT count(*) AS n FROM vec_refs WHERE hash = ?')
+    .get(hashText(shared));
+  assert.equal(Number(refs.n), 2, `vec_refs 里应有 2 条引用，实际 ${refs.n}`);
+});
+
+const fileE = path.join(root, 'e.jsonl.zstd');
+await checkAsync('第三场会话再说同样的话：零嵌入调用，只补引用', async () => {
+  store2.replaceFile(fileE, {
+    size: 100,
+    mtimeMs: 6000,
+    header: { ...header, id: 'session-e' },
+    title: '重复 C',
+    docs: [{ seq: 1, kind: 'user/message', role: 'user', time: 7000, text: shared }],
+  });
+  const beforeCalls = embedder2.calls;
+  const beforeTexts = embedder2.texts;
+  const result = await engine2.sync({ paths: [fileE] });
+  assert.equal(result.reused, 1, `复用引用 ${result.reused}`);
+  assert.equal(result.chunks, 1, `写入引用 ${result.chunks}`);
+  assert.equal(result.chars, 0, `不应嵌入任何字符，实际 ${result.chars}`);
+  assert.equal(embedder2.calls, beforeCalls, '不该发起嵌入请求');
+  assert.equal(embedder2.texts, beforeTexts);
+});
+
+await checkAsync('复用后三场会话都能被召回', async () => {
+  const recall = await engine2.semanticSearch(shared, { topK: 20 });
+  const sessions = new Set(recall.hits.map((hit) => hit.sessionId));
+  assert.ok(sessions.has('session-c') || sessions.has('session-d') || sessions.has('session-e'),
+    `命中会话：${[...sessions]}`);
+});
+
+await checkAsync('删掉一个引用不会误删另一场会话的向量', async () => {
+  engine2.removePath(fileD);
+  store2.removeFile(fileD);
+  const left = store2.db.prepare('SELECT count(*) AS n FROM vec_refs WHERE hash = ?')
+    .get(hashText(shared));
+  assert.equal(Number(left.n), 2, `剩余引用 ${left.n}`);
+  const content = store2.db.prepare('SELECT count(*) AS n FROM vec_content WHERE hash = ?')
+    .get(hashText(shared));
+  assert.equal(Number(content.n), 1, '内容被误删');
+  const recall = await engine2.semanticSearch(shared, { topK: 20 });
+  assert.equal(recall.hits.filter((hit) => hit.sessionId === 'session-d').length, 0);
+  assert.ok(
+    recall.hits.some((hit) => hit.sessionId === 'session-c' || hit.sessionId === 'session-e'),
+    '剩下的引用应仍可召回',
+  );
+});
+
+/* ── 3.6 并发：一次 embedTexts 拆成多路请求 ────────────────── */
+await checkAsync('concurrency=2 时两路并行，且返回顺序与输入一致', async () => {
+  const { Embedder } = await import('../src/embed.js');
+  const slow = new FakeEmbedder({ delayMs: 30 });
+  const embedderReal = new Embedder({
+    url: 'http://fake.invalid/v1/embeddings',
+    model: 'fake',
+    dim: DIM,
+    batch: 2,
+    concurrency: 2,
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body);
+      const vectors = await slow.embedTexts(body.input);
+      return new Response(
+        JSON.stringify({
+          data: vectors.map((vec) => ({ embedding: Array.from(vec) })),
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
+  const texts = ['缓存', '索引', '沙箱', '插件', '缓存加速'];
+  const out = await embedderReal.embedTexts(texts);
+  assert.equal(out.length, texts.length);
+  assert.equal(slow.maxInFlight, 2, `最大并发 ${slow.maxInFlight}`);
+  for (let i = 0; i < texts.length; i++) {
+    const expected = fakeVector(texts[i]);
+    assert.ok(
+      Math.abs(out[i][0] - expected[0]) < 1e-6 && Math.abs(out[i][1] - expected[1]) < 1e-6,
+      `第 ${i} 条顺序错位`,
+    );
+  }
+});
+
+await checkAsync('concurrency=1 时严格串行（老行为不变）', async () => {
+  const { Embedder } = await import('../src/embed.js');
+  const slow = new FakeEmbedder({ delayMs: 20 });
+  const embedderReal = new Embedder({
+    url: 'http://fake.invalid/v1/embeddings',
+    model: 'fake',
+    dim: DIM,
+    batch: 2,
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body);
+      const vectors = await slow.embedTexts(body.input);
+      return new Response(
+        JSON.stringify({ data: vectors.map((vec) => ({ embedding: Array.from(vec) })) }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
+  await embedderReal.embedTexts(['缓存', '索引', '沙箱']);
+  assert.equal(slow.maxInFlight, 1, `最大并发 ${slow.maxInFlight}`);
+});
+
+/* ── 3.7 老库迁移：vec_chunks → vec_content + vec_refs ────── */
+await checkAsync('0.5.x 的 vec_chunks 老库自动迁移成内容表 + 引用表', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const legacyPath = path.join(root, 'legacy.db');
+  const legacy = new DatabaseSync(legacyPath);
+  legacy.exec(`
+    CREATE TABLE vec_meta(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE vec_chunks(
+      slot INTEGER PRIMARY KEY, path TEXT NOT NULL, chunk_ix INTEGER NOT NULL,
+      rid INTEGER NOT NULL, start INTEGER NOT NULL, len INTEGER NOT NULL,
+      hash TEXT NOT NULL, scale REAL NOT NULL, vec BLOB NOT NULL, UNIQUE(path, hash)
+    );
+    CREATE INDEX vec_chunks_path ON vec_chunks(path);
+  `);
+  const vec = new Int8Array(DIM).fill(1);
+  legacy.prepare(
+    'INSERT INTO vec_chunks(slot, path, chunk_ix, rid, start, len, hash, scale, vec) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(1, 'legacy-a', 0, 10, 0, 20, 'h-shared', 0.01, vec);
+  legacy.prepare(
+    'INSERT INTO vec_chunks(slot, path, chunk_ix, rid, start, len, hash, scale, vec) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(2, 'legacy-b', 0, 11, 0, 20, 'h-shared', 0.01, vec);
+  legacy.close();
+
+  const legacyStore = new Store(legacyPath);
+  const tables = legacyStore.db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'vec_%' ORDER BY name")
+    .all()
+    .map((row) => row.name);
+  assert.deepEqual(tables, ['vec_content', 'vec_meta', 'vec_refs'], `表：${tables}`);
+  const contents = legacyStore.db.prepare('SELECT count(*) AS n FROM vec_content').get();
+  const refs = legacyStore.db.prepare('SELECT count(*) AS n FROM vec_refs').get();
+  assert.equal(Number(contents.n), 1, '同一 hash 应只留一份内容');
+  assert.equal(Number(refs.n), 2, `引用 ${refs.n}`);
+  const migrated = new VectorEngine({ store: legacyStore, config: engineConfig, embedder: new FakeEmbedder() });
+  await migrated.init();
+  assert.equal(migrated.vs.liveContent, 1, `内容 ${migrated.vs.liveContent}`);
+  assert.equal(migrated.vs.live, 2, `引用 ${migrated.vs.live}`);
+  legacyStore.close();
 });
 
 /* ── 4. 换模型整库作废 ────────────────────────────────────── */

@@ -119,6 +119,12 @@ writeFileSync(join(PROFILE, 'package.json'), JSON.stringify({
   },
 }));
 
+/* 假通道里的「最新版」从本机版本算出来，版本号一升测试不用跟着改 */
+const NEXT_VERSION = (() => {
+  const [major, minor, patch] = String(LOADED_VERSION).split('.').map((part) => Number(part) || 0);
+  return `${major}.${minor}.${patch + 1}`;
+})();
+
 const fetchCalls = [];
 const fakeFetch = async (url) => {
   fetchCalls.push(String(url));
@@ -129,8 +135,8 @@ const fakeFetch = async (url) => {
       json: async () => ({
         name: PACKAGE_NAME,
         channel: 'stable',
-        latest: '0.5.1',
-        versions: { '0.5.1': { url: 'https://example.test/x.tgz', engines: { dsh: '>=0.2.0' } } },
+        latest: NEXT_VERSION,
+        versions: { [NEXT_VERSION]: { url: 'https://example.test/x.tgz', engines: { dsh: '>=0.2.0' } } },
       }),
       text: async () => '',
     };
@@ -157,9 +163,9 @@ const handle = createUpdateRoutes(updater);
   assert.equal(res.status, 200);
   const info = res.json;
   assert.equal(info.channel.kind, 'github', '从 release tarball 装的副本应走 GitHub 通道');
-  assert.equal(info.latest, '0.5.1');
+  assert.equal(info.latest, NEXT_VERSION);
   assert.equal(info.current, LOADED_VERSION);
-  assert.equal(info.hasUpdate, true, '0.5.1 应比本机当前版本新');
+  assert.equal(info.hasUpdate, true, `${NEXT_VERSION} 应比本机当前版本 ${LOADED_VERSION} 新`);
   assert.equal(info.installSpec, 'https://example.test/x.tgz', '安装目标取 release 里登记的那个 URL');
   assert.ok(fetchCalls.some((u) => u.endsWith('/releases/latest/download/channel.json')), '主路径是 release 里的 channel.json');
 }

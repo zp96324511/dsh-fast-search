@@ -122,11 +122,14 @@ OpenAI 兼容嵌入服务（默认按 bge-large 调参）把对话正文嵌进�
 - **相关性门槛。** 实测 bge-large 对中文会话语料：相关查询 top 相似度 0.57–0.71，
   无关查询（「今天天气怎么样」）top 只有 0.25–0.26。所以 `minScore` 默认 0.45：
   **最佳分低于它就不召回**，单条再按 0.75×minScore 砍尾巴，避免把 60 条噪声当结果。
-- **建库是后台慢活。** 嵌一段 480 字的块约 0.8 秒；这台服务约 600 字符/秒、并发不提速。
-  对话正文（用户 + 助手 + 标题）合计 382 万字符 ≈ **1.9 小时**；把工具输出也算上是 5300 万字符 ≈ 23 小时。
-  所以默认只嵌对话正文，启动 8 秒后开始，30 分钟兜底一轮，进度与 ETA 看 `/vectors`。
-- **断点续跑。** 块按 `(path, hash)` 去重：文件追加写盘后只有新块要重新嵌入；
-  老块的 rowid 会自动改指向。模型 / 维度 / 切块版本变了则旧向量整库作废，不混用两套距离。
+- **建库是后台慢活。** 硬件升级后实测：单路约 2,000 字符/秒，2 路并发约 3,900（4 路无增益、
+  8 路 502），批大小 8→64 不影响总吞吐。所以默认 `batch: 8`、`concurrency: 1`，
+  服务扛得住时建议 `concurrency: 2`。启动 8 秒后开始，30 分钟兜底一轮，进度与 ETA 看 `/vectors`。
+- **同一段文本只嵌一次。** 块按内容哈希去重：向量存在 `vec_content`（每段文本一份），
+  `vec_refs` 存每个会话文件里的位置。会话开头注入的 skill 清单、HiveMem 简报、fork 出来的历史
+  几乎全是重复文本——实测约占 49% 的字符量，这部分现在零成本复用。
+- **断点续跑。** 文件追加写盘后只有新内容要重新嵌入；老块的 rowid 会自动改指向。
+  模型 / 维度 / 切块版本变了则旧向量整库作废，不混用两套距离。
 
 一次完整的建库（数据库副本上实测）：
 
@@ -161,7 +164,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
    store.js ◄────────────────── router.js ◄── search.js ◄── vectors.js
    (水位线/增量/int8 向量)          /status /search        (RRF 融合)  (内存点积)
                                    /reindex /vectors*          │
-                                        │                     └── vec_chunks(path,hash)
+                                        │                     └── vec_content(hash) + vec_refs(path,hash)
                                         ▼
                                   HTTP(JSON) ──► client.js 面板
 ```
@@ -172,7 +175,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 | `src/decode.js` | 日志解码：`user/message`、`assistant/message`(text)、`tool/call`、`tool/result`、`system/message`、`session/title` |
 | `src/tokenize.js` | `cjkSpace`（建索引）/ `cjkUnspace`（还原）/ `compileQuery`（AND·OR·括号 → FTS5 MATCH，含语法错误降级） |
 | `src/snippet.js` | 片段窗口 + 高亮，返回 `[{text, mark}]` 段数组（React 渲染，不拼 HTML） |
-| `src/store.js` | FTS5 + 水位线表 + `vec_chunks`；`replaceFile` 单事务先删后插；两阶段 `search()` 与工作区/时间筛选 |
+| `src/store.js` | FTS5 + 水位线表 + `vec_content`/`vec_refs`（老 `vec_chunks` 打开时自动迁移）；`replaceFile` 单事务先删后插；两阶段 `search()` 与工作区/时间筛选 |
 | `src/indexer.js` | 全量对账（size+mtime 跳过）、`fs.watch` 增删、15 分钟兜底扫描 |
 | `src/chunk.js` | 语义切块：480 字符/块，切点优先段落 > 换行 > 句末标点，块哈希用于去重 |
 | `src/embed.js` | 嵌入客户端（OpenAI 兼容 `/v1/embeddings`）：批处理、退避重试、L2 归一化、int8 量化 |
@@ -190,7 +193,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 
 | 路由 | 说明 |
 |---|---|
-| `GET /status` | `{ version, sessionsDir, dbPath, dbBytes, docs, sessions, files, searchMode, index: { phase, done, total, indexed, skipped, removed, lastError }, vectors: { enabled, ready, paused, model, dim, chunks, bytes, docsCovered, docsTotal, progress: { phase, chunks, chunksTotal, chars, charsTotal, rate, etaMs }, lastError } }` |
+| `GET /status` | `{ version, sessionsDir, dbPath, dbBytes, docs, sessions, files, searchMode, index: { phase, done, total, indexed, skipped, removed, lastError }, vectors: { enabled, ready, paused, model, dim, batch, concurrency, chunks, contents, bytes, docsCovered, docsTotal, progress: { phase, chunks, chunksTotal, chars, charsTotal, embedded, reused, rate, etaMs }, lastError } }` |
 | `GET /workspaces` | `{ workspaces: [{ cwd, sessions, docs, updatedAt }] }`，按 `updatedAt`（该工作区最近一条消息）倒序 |
 | `GET\|POST /search` | 入参 `q`（必填）、`limit`（≤300）、`groupLimit`、`perSession`、`includeTotal`、`semantic`（`off`/`auto`/`on`，也接受 `true`/`false`）；筛选 `workspace`（cwd 原值）、`kinds`（消息类型数组或逗号分隔字符串，也接受单值别名 `kind`；值可用事件全名或短名 `user`/`assistant`/`tool`/`result`/`title`）、`since`/`until`（毫秒或 ISO 日期）、`range`（`1d`/`1w`/`1m`，也接受 `day`/`week`/`month` 等别名） |
 | `POST /reindex` | 触发全量对账（`force=true` 时整库重建），异步，进度看 `/status` |
@@ -253,7 +256,8 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
           kinds: [user/message, assistant/message, session/title]
           chunkChars: 480                      # bge 的 512 token 上限，留一点余量
           chunkOverlap: 64
-          batch: 8                             # 实测吞吐与批大小无关，小批只为进度平滑
+          batch: 8                             # 单请求文本数；实测与总吞吐无关，小批只为进度平滑
+          concurrency: 2                       # 并发请求数；实测 2 路 ≈1.9×，4 路无增益、8 路 502
           autoThreshold: 5                     # 全文命中 < 5 条才自动补语义
           topK: 60
           minScore: 0.45                       # 最佳分低于它整体不召回；0 = 关掉门控
@@ -355,7 +359,7 @@ node bench\cdp-click.mjs   9222      # 点结果跳会话 + 回来恢复上次�
 | 语义下拉禁用、显示「关」 | 宿主没配 `vectors.url`（或 `enabled: false`）：`GET /vectors` 里 `enabled:false` 就是这个原因 |
 | `semantic.reason = "error"` | 嵌入服务连不上/超时/4xx：搜索会自动退回纯全文；`GET /vectors` 的 `lastError` 有原文 |
 | 语义召回一条都没有 | 先看 `docsCovered` 是不是 0（还没建库），再看 `topScore`：低于 `minScore`（0.45）时按设计不召回 |
-| 建库几小时还没完 | 正常。这台服务约 600 字符/秒、并发不提速；`POST /vectors/pause` 可随时停，数据不丢，下次续跑 |
+| 建库几小时还没完 | 正常。单路约 2,000 字符/秒（`concurrency: 2` 约 3,900）；`POST /vectors/pause` 可随时停，数据不丢，下次续跑 |
 | 换了嵌入模型/维度 | 旧向量会自动作废（日志里写「向量索引作废」），需要重新建一轮 |
 
 ## 变更记录

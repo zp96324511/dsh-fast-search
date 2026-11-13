@@ -1,9 +1,10 @@
 /**
  * 嵌入客户端：一个 OpenAI 兼容的 `/v1/embeddings` 客户端，零依赖。
  *
- * 目标服务实测（2026-11-09，bge-large / 1024 维）：
- * - 每次请求的**串行**吞吐约 600–650 字符/秒，且**并发请求不提速**（4 路并发总吞吐不变），
- *   所以默认 `concurrency: 1`、`batch: 8`——批再大只是把进度粒度变粗、超时窗口变长。
+ * 目标服务实测（2026-11-13，bge-large / 1024 维，硬件升级后）：
+ * - 串行约 2,000 字符/秒；2 路并发约 3,900（≈1.9×）；4 路不再涨（3,600–3,750），
+ *   8 路直接被网关 502。所以默认 `concurrency: 1`、`batch: 8`，服务扛得住时建议 2。
+ * - 批大小 8→64 的总吞吐不变，只是把单请求拉长、进度变粗、超时窗口变大。
  * - 超过 512 token 的输入**不报错、静默截断**，所以切块必须自己守住上限（见 chunk.js）。
  * - 返回的向量已 L2 归一化，这里仍会再归一化一次（不依赖服务端行为）。
  *
@@ -91,7 +92,7 @@ export function dotQuantized(block, offset, data, scale, query, queryScale) {
 export class Embedder {
   /**
    * @param {{ url: string, model?: string, apiKey?: string, dim?: number, batch?: number,
-   *           timeoutMs?: number, retries?: number, userAgent?: string,
+   *           concurrency?: number, timeoutMs?: number, retries?: number, userAgent?: string,
    *           fetchImpl?: typeof fetch, log?: (msg: string) => void }} options
    */
   constructor({
@@ -100,6 +101,7 @@ export class Embedder {
     apiKey = '',
     dim = 1024,
     batch = 8,
+    concurrency = 1,
     timeoutMs = 120_000,
     retries = 3,
     userAgent = 'dsh-fast-search',
@@ -113,6 +115,9 @@ export class Embedder {
     this.apiKey = apiKey;
     this.dim = dim > 0 ? dim : 0;
     this.batch = Math.max(1, Math.trunc(batch) || 8);
+    /* 实测 2 路是这台服务的甜点；4 路无增益、8 路 502，所以客户端最多放 4 路，
+     * 默认仍是 1（不改变老配置的行为）。 */
+    this.concurrency = Math.max(1, Math.min(4, Math.trunc(concurrency) || 1));
     this.timeoutMs = Math.max(1000, Math.trunc(timeoutMs) || 120_000);
     this.retries = Math.max(1, Math.trunc(retries) || 3);
     this.userAgent = userAgent;
@@ -197,23 +202,44 @@ export class Embedder {
 
   /**
    * 批量嵌入，返回**已归一化**的 Float32Array。
+   * 请求按 `batch` 切片；`concurrency > 1` 时多片并行，但结果顺序与输入严格一致。
    * @param {string[]} texts
    * @returns {Promise<Float32Array[]>}
    */
   async embedTexts(texts) {
-    const out = [];
+    if (texts.length === 0) return [];
+    /** @type {Array<{ at: number, slice: string[] }>} */
+    const slices = [];
     for (let at = 0; at < texts.length; at += this.batch) {
-      const slice = texts.slice(at, at + this.batch);
-      const rows = await this.#request(slice);
-      for (const row of rows) {
-        const vec = new Float32Array(row.length);
-        for (let i = 0; i < row.length; i++) vec[i] = row[i];
-        out.push(normalize(vec));
-      }
-      this.stats.batches += 1;
-      this.stats.texts += slice.length;
-      for (const text of slice) this.stats.chars += text.length;
+      slices.push({ at, slice: texts.slice(at, at + this.batch) });
     }
+    const out = new Array(texts.length);
+    let cursor = 0;
+    /** @type {Error | null} */
+    let failure = null;
+
+    const lane = async () => {
+      while (failure === null && cursor < slices.length) {
+        const job = slices[cursor++];
+        try {
+          const rows = await this.#request(job.slice);
+          for (let i = 0; i < rows.length; i++) {
+            const vec = new Float32Array(rows[i].length);
+            for (let d = 0; d < rows[i].length; d++) vec[d] = rows[i][d];
+            out[job.at + i] = normalize(vec);
+          }
+          this.stats.batches += 1;
+          this.stats.texts += job.slice.length;
+          for (const text of job.slice) this.stats.chars += text.length;
+        } catch (err) {
+          failure = /** @type {Error} */ (err);
+          throw err;
+        }
+      }
+    };
+
+    const lanes = Math.min(this.concurrency, slices.length);
+    await Promise.all(Array.from({ length: lanes }, lane));
     return out;
   }
 

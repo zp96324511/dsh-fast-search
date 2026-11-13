@@ -17,6 +17,7 @@
 #           model: bge-large
 #           dim: 1024
 #           batch: 8
+#           concurrency: 2
 #           autoThreshold: 5
 #           minScore: 0.45
 - insert:

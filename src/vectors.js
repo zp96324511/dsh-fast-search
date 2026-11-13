@@ -12,7 +12,8 @@
  *
  * 关键表：
  *   vec_meta   模型名 / 维度 / 切块版本 / 块长。任一变化 → 整库向量作废（向量不可迁移）。
- *   vec_chunks (path, hash) 唯一：会话日志只追加不改写，整文件重解后只有**新块**需要重新嵌入。
+ *   vec_content (hash PK) 存一份向量、vec_refs (path, hash) 存引用：
+ *   同一段文本在多个会话里出现只占一份向量，整文件重解后只有**新内容**需要重新嵌入。
  *   内存按 4096 块一组放进独立的 Int8Array，扩容时只扩元数据数组，不拷贝向量本体。
  */
 
@@ -37,6 +38,11 @@ export const DEFAULT_VECTORS = {
   chunkChars: 480,
   chunkOverlap: 64,
   batch: 8,
+  /**
+   * 并发请求数。实测这台 bge 服务：1 路 ≈2.0k 字符/秒，2 路 ≈3.9k，4 路无增益，8 路 502。
+   * 默认 1（老配置行为不变），服务扛得住时设 2。
+   */
+  concurrency: 1,
   /** 后台建库的字符预算（字符/分钟），0 = 不限速。 */
   maxCharsPerMinute: 0,
   /** FTS 命中少于这个数才自动补一轮语义召回。 */
@@ -114,7 +120,10 @@ export class TopK {
   }
 }
 
-/** 向量矩阵：SQLite 是事实来源，内存是查询用的镜像。 */
+/** 向量矩阵：SQLite 是事实来源，内存是查询用的镜像。
+ *
+ * 0.6.0 起内存按「唯一内容」分配槽位：同一段文本只占一份向量，
+ * 多个 `(path, hash)` 引用共享它。查询命中一次内容，再从引用里挑一条可展示的块。 */
 export class VectorStore {
   /** @param {{ db: any, dim: number, log?: (msg: string) => void }} options */
   constructor({ db, dim, log = () => {} }) {
@@ -123,39 +132,64 @@ export class VectorStore {
     this.log = log;
 
     this.loaded = false;
-    this.count = 0; // 内存条目总数（含已删除的墓碑）
-    this.live = 0;
+    this.count = 0; // 已分配的内容槽位数（含孤儿墓碑）
+    this.live = 0; // 引用总数（对外仍叫 chunks）
+    this.liveContent = 0; // 有效内容数
     /** @type {Int8Array[]} */
     this.blocks = [];
     this.capacity = 0;
-    this.rids = new Int32Array(0);
-    this.starts = new Int32Array(0);
-    this.lens = new Int32Array(0);
-    this.ixs = new Int32Array(0);
+    /** @type {string[]} slot → hash；空串表示墓碑 */
+    this.hashes = [];
     this.scales = new Float32Array(0);
-    /** @type {Map<string, Map<string, number>>} path → (hash → 条目下标) */
+    /** @type {Map<string, number>} hash → slot */
+    this.hashSlots = new Map();
+    /** @type {Map<string, Array<{ path: string, hash: string, chunkIx: number, rid: number,
+     *                               start: number, len: number }>>} hash → 引用列表 */
+    this.refsByHash = new Map();
+    /** @type {Map<string, Map<string, any>>} path → (hash → 引用对象) */
     this.entriesByPath = new Map();
-    this.nextSlot = 1;
 
     this.st = {
-      count: db.prepare('SELECT count(*) AS n FROM vec_chunks'),
-      iterate: db.prepare(
-        'SELECT slot, path, chunk_ix, rid, start, len, hash, scale, vec FROM vec_chunks ORDER BY slot',
+      countContent: db.prepare('SELECT count(*) AS n FROM vec_content'),
+      iterateContent: db.prepare('SELECT hash, scale, vec FROM vec_content ORDER BY rowid'),
+      iterateRefs: db.prepare(
+        'SELECT path, chunk_ix, rid, start, len, hash FROM vec_refs ORDER BY path, chunk_ix',
       ),
-      maxSlot: db.prepare('SELECT max(slot) AS m FROM vec_chunks'),
-      insert: db.prepare(
-        'INSERT INTO vec_chunks(slot, path, chunk_ix, rid, start, len, hash, scale, vec) ' +
-          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      insertContent: db.prepare(
+        'INSERT OR IGNORE INTO vec_content(hash, scale, vec) VALUES (?, ?, ?)',
       ),
-      delPath: db.prepare('DELETE FROM vec_chunks WHERE path = ?'),
+      insertRef: db.prepare(
+        'INSERT OR IGNORE INTO vec_refs(path, chunk_ix, rid, start, len, hash) ' +
+          'VALUES (?, ?, ?, ?, ?, ?)',
+      ),
+      delContent: db.prepare('DELETE FROM vec_content WHERE hash = ?'),
+      delPath: db.prepare('DELETE FROM vec_refs WHERE path = ?'),
       delHashes: db.prepare(
-        'DELETE FROM vec_chunks WHERE path = ? AND hash IN (SELECT value FROM json_each(?))',
+        'DELETE FROM vec_refs WHERE path = ? AND hash IN (SELECT value FROM json_each(?))',
       ),
       updateSpan: db.prepare(
-        'UPDATE vec_chunks SET rid = ?, start = ?, len = ?, chunk_ix = ? WHERE path = ? AND hash = ?',
+        'UPDATE vec_refs SET rid = ?, start = ?, len = ?, chunk_ix = ? WHERE path = ? AND hash = ?',
       ),
-      delAll: db.prepare('DELETE FROM vec_chunks'),
+      pruneOrphans: db.prepare(
+        'DELETE FROM vec_content WHERE hash NOT IN (SELECT hash FROM vec_refs)',
+      ),
+      delRefs: db.prepare('DELETE FROM vec_refs'),
+      delContents: db.prepare('DELETE FROM vec_content'),
     };
+  }
+
+  /** 清空内存镜像（不动数据库）。 */
+  #reset() {
+    this.count = 0;
+    this.live = 0;
+    this.liveContent = 0;
+    this.blocks = [];
+    this.capacity = 0;
+    this.hashes = [];
+    this.scales = new Float32Array(0);
+    this.hashSlots = new Map();
+    this.refsByHash = new Map();
+    this.entriesByPath = new Map();
   }
 
   get size() {
@@ -172,10 +206,6 @@ export class VectorStore {
       next.set(old);
       return next;
     };
-    this.rids = grow(this.rids, Int32Array);
-    this.starts = grow(this.starts, Int32Array);
-    this.lens = grow(this.lens, Int32Array);
-    this.ixs = grow(this.ixs, Int32Array);
     this.scales = grow(this.scales, Float32Array);
     this.capacity = capacity;
   }
@@ -191,49 +221,104 @@ export class VectorStore {
     return block;
   }
 
-  /** 追加一条：内存与 `entriesByPath` 同步更新。 */
-  #append(rid, start, len, ix, scale, data, hash, file) {
-    const i = this.count++;
-    this.#ensure(i + 1);
-    this.#blockFor(i).set(data, (i & BLOCK_MASK) * this.dim);
-    this.rids[i] = rid;
-    this.starts[i] = start;
-    this.lens[i] = len;
-    this.ixs[i] = ix;
-    this.scales[i] = scale;
-    let map = this.entriesByPath.get(file);
+  /** 追加一份唯一内容：分配矩阵槽位，并登记 hash → slot。 */
+  #appendContent(hash, scale, data) {
+    const slot = this.count++;
+    this.#ensure(slot + 1);
+    this.hashes[slot] = hash;
+    this.scales[slot] = scale;
+    this.#blockFor(slot).set(data, (slot & BLOCK_MASK) * this.dim);
+    this.hashSlots.set(hash, slot);
+    this.liveContent += 1;
+    return slot;
+  }
+
+  /** 追加一条引用：同一内容可以被多个 (path, hash) 指向。 */
+  #appendRef(path, chunkIx, rid, start, len, hash) {
+    if (!this.hashSlots.has(hash)) return false;
+    const ref = { path, hash, chunkIx, rid, start, len };
+    let map = this.entriesByPath.get(path);
     if (map === undefined) {
       map = new Map();
-      this.entriesByPath.set(file, map);
+      this.entriesByPath.set(path, map);
     }
-    map.set(hash, i);
+    map.set(hash, ref);
+    let refs = this.refsByHash.get(hash);
+    if (refs === undefined) {
+      refs = [];
+      this.refsByHash.set(hash, refs);
+    }
+    refs.push(ref);
     this.live += 1;
+    return true;
+  }
+
+  /** 内容不再被任何引用需要时：删库、标墓碑。 */
+  #removeContent(hash) {
+    const slot = this.hashSlots.get(hash);
+    if (slot === undefined) return;
+    this.hashSlots.delete(hash);
+    this.hashes[slot] = '';
+    this.liveContent -= 1;
+    this.st.delContent.run(hash);
+  }
+
+  /** 摘掉一条引用；最后一个引用消失时顺手回收内容。 */
+  #removeRef(ref) {
+    const map = this.entriesByPath.get(ref.path);
+    if (map !== undefined) {
+      map.delete(ref.hash);
+      if (map.size === 0) this.entriesByPath.delete(ref.path);
+    }
+    const refs = this.refsByHash.get(ref.hash);
+    if (refs !== undefined) {
+      const at = refs.indexOf(ref);
+      if (at !== -1) refs.splice(at, 1);
+      if (refs.length === 0) {
+        this.refsByHash.delete(ref.hash);
+        this.#removeContent(ref.hash);
+      }
+    }
+    this.live -= 1;
+  }
+
+  /** 从引用列表里挑一条：优先允许的（筛选后）里 rid 最大的，近似「最新出现的会话」。 */
+  #refFor(refs, accept) {
+    let best = null;
+    for (const ref of refs) {
+      if (accept !== null && !accept(ref.rid)) continue;
+      if (best === null || ref.rid > best.rid) best = ref;
+    }
+    return best;
   }
 
   /** 从 SQLite 全量载入内存（首次查询 / 压缩墓碑时调用）。 */
   load() {
     if (this.loaded) return this;
-    const total = this.st.count.get().n;
-    this.count = 0;
-    this.live = 0;
-    this.blocks = [];
-    this.capacity = 0;
-    this.rids = new Int32Array(0);
-    this.starts = new Int32Array(0);
-    this.lens = new Int32Array(0);
-    this.ixs = new Int32Array(0);
-    this.scales = new Float32Array(0);
-    this.entriesByPath = new Map();
-    this.nextSlot = (Number(this.st.maxSlot.get().m) || 0) + 1;
-
-    if (total > 0) {
-      this.#ensure(total);
-      for (const row of this.st.iterate.iterate()) {
-        this.#append(row.rid, row.start, row.len, row.chunk_ix, row.scale, row.vec, row.hash, row.path);
-      }
+    /* 没有引用的内容是 0.5.x 删除路径留下的孤儿；先清掉，别占矩阵 */
+    this.st.pruneOrphans.run();
+    const total = this.st.countContent.get().n;
+    this.#reset();
+    this.#ensure(total);
+    for (const row of this.st.iterateContent.iterate()) {
+      const slot = this.count++;
+      this.hashes[slot] = row.hash;
+      this.scales[slot] = row.scale;
+      this.#blockFor(slot).set(row.vec, (slot & BLOCK_MASK) * this.dim);
+      this.hashSlots.set(row.hash, slot);
+      this.liveContent += 1;
+    }
+    for (const row of this.st.iterateRefs.iterate()) {
+      this.#appendRef(row.path, row.chunk_ix, row.rid, row.start, row.len, row.hash);
     }
     this.loaded = true;
     return this;
+  }
+
+  /** 这段文本是否已经有向量（跨文件复用）。 */
+  hasContent(hash) {
+    if (!this.loaded) this.load();
+    return this.hashSlots.has(hash);
   }
 
   /** @param {string} file */
@@ -250,22 +335,27 @@ export class VectorStore {
       ? keep
       : new Set(keep instanceof Map ? keep.keys() : keep);
     const stale = [];
-    for (const [hash, index] of map) {
-      if (!wanted.has(hash)) stale.push({ hash, index });
+    for (const [hash, ref] of map) {
+      if (!wanted.has(hash)) stale.push({ hash, ref });
     }
     if (stale.length === 0) return 0;
-    this.st.delHashes.run(file, JSON.stringify(stale.map((item) => item.hash)));
-    for (const { hash, index } of stale) {
-      this.rids[index] = -1;
-      map.delete(hash);
-      this.live -= 1;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.st.delHashes.run(file, JSON.stringify(stale.map((item) => item.hash)));
+      for (const { ref } of stale) this.#removeRef(ref);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      this.loaded = false;
+      this.load();
+      throw err;
     }
     this.maybeCompact();
     return stale.length;
   }
 
   /**
-   * 整文件重解后，同一条文本的 rowid 会变（先删后插），向量行必须跟着改指向，
+   * 整文件重解后，同一条文本的 rowid 会变（先删后插），引用必须跟着改指向，
    * 否则语义命中会指向一条已经不存在的文档。
    * @param {string} file
    * @param {Map<string, { rid: number, start: number, len: number, chunkIx: number }>} spans
@@ -276,21 +366,15 @@ export class VectorStore {
     let changed = 0;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      for (const [hash, index] of map) {
+      for (const [hash, ref] of map) {
         const next = spans.get(hash);
         if (next === undefined) continue;
-        if (
-          this.rids[index] === next.rid &&
-          this.starts[index] === next.start &&
-          this.lens[index] === next.len
-        ) {
-          continue;
-        }
+        if (ref.rid === next.rid && ref.start === next.start && ref.len === next.len) continue;
         this.st.updateSpan.run(next.rid, next.start, next.len, next.chunkIx, file, hash);
-        this.rids[index] = next.rid;
-        this.starts[index] = next.start;
-        this.lens[index] = next.len;
-        this.ixs[index] = next.chunkIx;
+        ref.rid = next.rid;
+        ref.start = next.start;
+        ref.len = next.len;
+        ref.chunkIx = next.chunkIx;
         changed += 1;
       }
       this.db.exec('COMMIT');
@@ -302,8 +386,11 @@ export class VectorStore {
   }
 
   /**
+   * 写入一批块。同一段文本（hash）只存一份向量：库里已有的直接复用，
+   * 只有新内容才需要 `data` / `scale`。
    * @param {Array<{ path: string, chunkIx: number, rid: number, start: number, len: number,
-   *                  hash: string, data: Int8Array, scale: number }>} rows
+   *                  hash: string, data?: Int8Array, scale?: number }>} rows
+   * @returns {number} 写入的引用条数
    */
   insertMany(rows) {
     if (rows.length === 0) return 0;
@@ -313,19 +400,20 @@ export class VectorStore {
       for (const row of rows) {
         const map = this.entriesByPath.get(row.path);
         if (map !== undefined && map.has(row.hash)) continue;
-        const slot = this.nextSlot++;
-        this.st.insert.run(
-          slot,
+        if (!this.hashSlots.has(row.hash)) {
+          if (row.data === undefined || !Number.isFinite(row.scale)) continue;
+          this.st.insertContent.run(row.hash, row.scale, row.data);
+          this.#appendContent(row.hash, row.scale, row.data);
+        }
+        this.st.insertRef.run(
           row.path,
           row.chunkIx,
           row.rid,
           row.start,
           row.len,
           row.hash,
-          row.scale,
-          row.data,
         );
-        this.#append(row.rid, row.start, row.len, row.chunkIx, row.scale, row.data, row.hash, row.path);
+        this.#appendRef(row.path, row.chunkIx, row.rid, row.start, row.len, row.hash);
         written += 1;
       }
       this.db.exec('COMMIT');
@@ -344,12 +432,17 @@ export class VectorStore {
     const map = this.entriesByPath.get(file);
     if (map === undefined) return 0;
     const n = map.size;
-    this.st.delPath.run(file);
-    for (const index of map.values()) {
-      this.rids[index] = -1;
-      this.live -= 1;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.st.delPath.run(file);
+      for (const ref of [...map.values()]) this.#removeRef(ref);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      this.loaded = false;
+      this.load();
+      throw err;
     }
-    this.entriesByPath.delete(file);
     this.maybeCompact();
     return n;
   }
@@ -357,32 +450,26 @@ export class VectorStore {
   /** 墓碑过半就重载一次：SQLite 里没有墓碑，重载即压缩。 */
   maybeCompact() {
     if (!this.loaded) return;
-    if (this.count >= 4096 && this.live * 2 < this.count) {
+    if (this.count >= 4096 && this.liveContent * 2 < this.count) {
       this.loaded = false;
       this.load();
-      this.log(`[fast-search] 向量索引压缩：${this.count} 条槽位 → ${this.live} 条有效`);
+      this.log(
+        `[fast-search] 向量索引压缩：${this.count} 份内容 → ${this.liveContent} 份有效（${this.live} 条引用）`,
+      );
     }
   }
 
   /** 清空整个向量库（模型/维度/切块版本变化时）。 */
   clear() {
-    this.st.delAll.run();
-    this.count = 0;
-    this.live = 0;
-    this.blocks = [];
-    this.capacity = 0;
-    this.rids = new Int32Array(0);
-    this.starts = new Int32Array(0);
-    this.lens = new Int32Array(0);
-    this.ixs = new Int32Array(0);
-    this.scales = new Float32Array(0);
-    this.entriesByPath = new Map();
-    this.nextSlot = 1;
+    this.st.delRefs.run();
+    this.st.delContents.run();
+    this.#reset();
     this.loaded = true;
   }
 
   /**
    * 暴力点积 top-k。
+   * 每个唯一内容只算一次；命中后再从它的引用里挑一条（受筛选约束）作为展示位置。
    * @param {Int8Array} query 量化后的查询向量
    * @param {number} queryScale
    * @param {number} k
@@ -394,10 +481,13 @@ export class VectorStore {
     const top = new TopK(k);
     const count = this.count;
     for (let i = 0; i < count; i++) {
-      const rid = this.rids[i];
-      if (rid === -1) continue;
-      /* 先过滤再算点积：范围外的块连乘加都不做 */
-      if (accept !== null && !accept(rid)) continue;
+      const hash = this.hashes[i];
+      if (hash === '' || hash === undefined) continue;
+      const refs = this.refsByHash.get(hash);
+      if (refs === undefined || refs.length === 0) continue;
+      /* 先挑出可展示的引用再算点积：范围外/已删的块连乘加都不做 */
+      const ref = this.#refFor(refs, accept);
+      if (ref === null) continue;
       const block = this.blocks[i >> BLOCK_SHIFT];
       const offset = (i & BLOCK_MASK) * dim;
       let dot = 0;
@@ -406,13 +496,17 @@ export class VectorStore {
     }
     const out = [];
     for (const { score, index } of top.list()) {
+      const ref = this.#refFor(this.refsByHash.get(this.hashes[index]) ?? [], accept);
+      if (ref === null) continue;
       out.push({
         score,
         index,
-        rid: this.rids[index],
-        start: this.starts[index],
-        len: this.lens[index],
-        chunkIx: this.ixs[index],
+        hash: this.hashes[index],
+        rid: ref.rid,
+        path: ref.path,
+        start: ref.start,
+        len: ref.len,
+        chunkIx: ref.chunkIx,
       });
     }
     return out;
@@ -420,10 +514,12 @@ export class VectorStore {
 
   stats() {
     return {
+      /* 对外仍报引用数（用户关心的是「多少块被索引」），内容数是去重后的真实占用 */
       chunks: this.live,
+      contents: this.liveContent,
       slots: this.count,
       dim: this.dim,
-      bytes: this.live * (this.dim + 4),
+      bytes: this.liveContent * (this.dim + 4),
     };
   }
 }
@@ -476,6 +572,7 @@ export class VectorEngine {
       chars: 0,
       charsTotal: 0,
       embedded: 0,
+      reused: 0,
       rate: 0,
       etaMs: 0,
       startedAt: 0,
@@ -490,6 +587,7 @@ export class VectorEngine {
           apiKey: this.config.apiKey,
           dim: this.config.dim,
           batch: this.config.batch,
+          concurrency: this.config.concurrency,
           timeoutMs: this.config.timeoutMs,
           log,
         })
@@ -521,7 +619,8 @@ export class VectorEngine {
       this.log(
         `[fast-search] 向量索引作废（${mismatch.map((k) => `${k}: ${meta[k]} → ${want[k]}`).join(', ')}）`,
       );
-      this.store.db.exec('DELETE FROM vec_chunks');
+      this.store.db.exec('DELETE FROM vec_refs');
+      this.store.db.exec('DELETE FROM vec_content');
       this.store.db.exec('DELETE FROM vec_meta');
     }
     const setMeta = this.store.db.prepare(
@@ -682,12 +781,15 @@ export class VectorEngine {
     });
     this.lastError = null;
 
-    /* ① 扫描：切块 + 比对 hash。这一步纯 CPU，不花钱 */
+    /* ① 扫描：切块 + 比对 hash。这一步纯 CPU，不花钱。
+     *    注意去重是**两层**的：文件内按 hash 去重（块边界重叠会产出同一段文本），
+     *    跨文件/跨会话也按 hash 去重（会话开头的注入上下文、fork 出来的历史几乎全重复）。 */
     /** @type {Array<{ path: string, chunkIx: number, rid: number, start: number, len: number,
-     *                 hash: string, text: string }>} */
+     *                 hash: string }>} */
     const missing = [];
     const keepByPath = new Map();
-    let totalChars = 0;
+    /** @type {Map<string, { hash: string, text: string, refs: any[] }>} */
+    const groups = new Map();
     let docs = 0;
 
     const rows = scoped
@@ -714,13 +816,16 @@ export class VectorEngine {
         const span = { rid: doc.rid, start: chunk.start, len: chunk.end - chunk.start, chunkIx: ix };
         keep.set(chunk.hash, span);
         if (known !== null && known.has(chunk.hash)) continue;
-        missing.push({ path: doc.path, ...span, hash: chunk.hash, text: chunk.text });
-        totalChars += chunk.text.length;
+        const ref = { path: doc.path, ...span, hash: chunk.hash };
+        missing.push(ref);
+        let group = groups.get(chunk.hash);
+        if (group === undefined) groups.set(chunk.hash, (group = { hash: chunk.hash, text: chunk.text, refs: [] }));
+        group.refs.push(ref);
       }
     }
 
     /* ② 清理 + 重指：整文件重解后 rowid 会变（先删后插），
-     *    同一条文本的向量行必须跟着改指向，否则语义命中指向一条不存在的文档。 */
+     *    同一条文本的引用必须跟着改指向，否则语义命中指向一条不存在的文档。 */
     let pruned = 0;
     let retargeted = 0;
     for (const [file, keep] of keepByPath) {
@@ -728,10 +833,29 @@ export class VectorEngine {
       retargeted += vs.updateSpans(file, keep);
     }
 
+    /* ②.5 内容复用：这段文本库里已经有向量（别的会话说过一模一样的话），
+     *     只补引用、不再请求嵌入服务。 */
+    const reuseRows = [];
+    const todo = [];
+    let reusedChars = 0;
+    for (const group of groups.values()) {
+      if (vs.hasContent(group.hash)) {
+        for (const ref of group.refs) reuseRows.push(ref);
+        reusedChars += group.text.length * group.refs.length;
+      } else {
+        todo.push(group);
+      }
+    }
+
+    const totalChars = todo.reduce((sum, group) => sum + group.text.length, 0);
     state.docsTotal = docs;
+    /* 目标块数按「本轮开始时的块数 + 全部新增引用」算，且必须在补复用引用之前定下来，
+     * 否则复用那部分会被算两遍（vs.live 已经把它们加进去了） */
     state.chunksTotal = vs.live + missing.length;
-    state.chunks = vs.live;
     state.charsTotal = totalChars;
+    state.reused = reusedChars;
+    if (reuseRows.length > 0) vs.insertMany(reuseRows);
+    state.chunks = vs.live;
 
     if (missing.length === 0) {
       state.phase = 'idle';
@@ -739,24 +863,36 @@ export class VectorEngine {
       this.log(
         `[fast-search] 向量索引已最新：${vs.live} 块 / ${docs} 条文档 / ${Date.now() - started}ms`,
       );
-      return { chunks: 0, live: vs.live, docs, pruned, retargeted, ms: Date.now() - started };
+      return {
+        chunks: 0,
+        live: vs.live,
+        contents: vs.liveContent,
+        docs,
+        pruned,
+        retargeted,
+        reused: 0,
+        ms: Date.now() - started,
+      };
     }
 
-    /* ③ 嵌入：逐批（批次小是为了进度平滑，实测批大小对吞吐没有影响） */
+    /* ③ 嵌入：一次喂 batch×concurrency 条，Embedder 内部拆成并发请求。
+     *    只嵌「库里还没有的内容」，同一段文本在多场会话里出现也只嵌一次。 */
     state.phase = 'embedding';
     const batch = Math.max(1, Math.trunc(this.config.batch) || 8);
+    const lanes = Math.max(1, Math.min(4, Math.trunc(this.config.concurrency) || 1));
+    const window = batch * lanes;
     const ratePerMinute = Number(this.config.maxCharsPerMinute) || 0;
     const limit = maxChars > 0 ? maxChars : Infinity;
     let charsDone = 0;
-    let embedded = 0;
+    let embedded = reuseRows.length;
 
-    for (let at = 0; at < missing.length; at += batch) {
+    for (let at = 0; at < todo.length; at += window) {
       if (this.stopped || this.paused) break;
       if (charsDone >= limit) break;
-      const slice = missing.slice(at, at + batch);
+      const slice = todo.slice(at, at + window);
       let vectors;
       try {
-        vectors = await this.embedder.embedTexts(slice.map((item) => item.text));
+        vectors = await this.embedder.embedTexts(slice.map((group) => group.text));
       } catch (err) {
         state.phase = 'error';
         this.lastError = String(err?.message ?? err);
@@ -764,10 +900,10 @@ export class VectorEngine {
       }
       const rowsOut = [];
       for (let i = 0; i < slice.length; i++) {
-        const item = slice[i];
+        const group = slice[i];
         const { data, scale } = quantize(vectors[i]);
-        rowsOut.push({ ...item, data, scale });
-        charsDone += item.text.length;
+        for (const ref of group.refs) rowsOut.push({ ...ref, data, scale });
+        charsDone += group.text.length;
       }
       embedded += vs.insertMany(rowsOut);
       state.embedded = embedded;
@@ -799,10 +935,20 @@ export class VectorEngine {
       }
     }
     this.log(
-      `[fast-search] 向量索引完成：新增 ${embedded} 块（清理 ${pruned}），共 ${vs.live} 块，` +
-        `${charsDone} 字符，耗时 ${state.finishedAt - started}ms`,
+      `[fast-search] 向量索引完成：新增 ${embedded} 块（复用 ${reuseRows.length}，清理 ${pruned}），` +
+        `共 ${vs.live} 块 / ${vs.liveContent} 份内容，嵌入 ${charsDone} 字符，` +
+        `耗时 ${state.finishedAt - started}ms`,
     );
-    return { chunks: embedded, live: vs.live, chars: charsDone, pruned, retargeted, ms: state.finishedAt - started };
+    return {
+      chunks: embedded,
+      live: vs.live,
+      contents: vs.liveContent,
+      chars: charsDone,
+      pruned,
+      retargeted,
+      reused: reuseRows.length,
+      ms: state.finishedAt - started,
+    };
   }
 
   /**
@@ -880,12 +1026,14 @@ export class VectorEngine {
   /** 面板/CLI 看到的全部状态。 */
   status() {
     const vs = this.vs;
-    const stats = vs === null ? { chunks: 0, slots: 0, dim: this.config.dim, bytes: 0 } : vs.stats();
+    const stats = vs === null
+      ? { chunks: 0, contents: 0, slots: 0, dim: this.config.dim, bytes: 0 }
+      : vs.stats();
     let docsCovered = 0;
     if (vs !== null && vs.loaded) {
       const seen = new Set();
-      for (let i = 0; i < vs.count; i++) {
-        if (vs.rids[i] !== -1) seen.add(vs.rids[i]);
+      for (const refs of vs.refsByHash.values()) {
+        for (const ref of refs) seen.add(ref.rid);
       }
       docsCovered = seen.size;
     }
@@ -908,7 +1056,10 @@ export class VectorEngine {
       dim: Number(this.config.dim) || 0,
       kinds: this.config.kinds,
       chunkChars: this.config.chunkChars,
+      batch: Number(this.config.batch) || 8,
+      concurrency: Number(this.config.concurrency) || 1,
       chunks: stats.chunks,
+      contents: stats.contents,
       bytes: stats.bytes,
       docsCovered,
       docsTotal: this.docsTotalCache.value,

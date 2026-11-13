@@ -8,3 +8,4 @@ bench/out-small/
 *.log
 *.log.err
 node_modules/
+*.tgz

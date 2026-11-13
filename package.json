@@ -1,6 +1,6 @@
 {
   "name": "dsh-fast-search",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "会话全文搜索：自建 SQLite FTS5 增量索引，支持 且/或/括号 组合查询与工作区、消息类型、时间范围筛选；可选接入独立的 bge 嵌入服务做语义召回（RRF 融合、服务不可达静默降级）；自带 GitHub Release 在线升级通道。",
   "type": "module",
   "main": "index.js",

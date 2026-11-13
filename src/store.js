@@ -19,8 +19,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { cjkSpace, cjkUnspace, compileQuery } from './tokenize.js';
 import { buildSnippet } from './snippet.js';
 
-/** 库结构版本；改动布局就 +1，旧库会被整体重建（索引可重建，不做迁移）。 */
-export const SCHEMA_VERSION = 1;
+/** 库结构版本；改动布局就 +1，旧库会被整体重建（索引可重建，不做迁移）。
+ * 2：向量表从「每行存一份向量」改为 vec_content(唯一内容) + vec_refs(引用)；
+ *    vec_chunks 老库在打开时自动迁移（见 migrateVectorSchema），不触发全文索引重建。 */
+export const SCHEMA_VERSION = 2;
 
 /** 会话事件类型（消息类型）的规范值。面板、CLI、HTTP 都按这一份清单筛选。 */
 export const KIND_VALUES = [
@@ -108,20 +110,54 @@ CREATE TABLE IF NOT EXISTS vec_meta(
   key   TEXT PRIMARY KEY,
   value TEXT
 );
-CREATE TABLE IF NOT EXISTS vec_chunks(
-  slot     INTEGER PRIMARY KEY,
+-- 同一段文本只存一份向量（hash 是内容哈希）；引用可以有很多条。
+CREATE TABLE IF NOT EXISTS vec_content(
+  hash  TEXT PRIMARY KEY,
+  scale REAL NOT NULL,
+  vec   BLOB NOT NULL
+);
+-- 一条引用 = 某个会话文件里的某个块位置；同一文件内 (path, hash) 唯一。
+CREATE TABLE IF NOT EXISTS vec_refs(
   path     TEXT NOT NULL,
   chunk_ix INTEGER NOT NULL,
   rid      INTEGER NOT NULL,
   start    INTEGER NOT NULL,
   len      INTEGER NOT NULL,
   hash     TEXT NOT NULL,
-  scale    REAL NOT NULL,
-  vec      BLOB NOT NULL,
-  UNIQUE(path, hash)
-);
-CREATE INDEX IF NOT EXISTS vec_chunks_path ON vec_chunks(path);
+  PRIMARY KEY(path, hash)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS vec_refs_hash ON vec_refs(hash);
 `;
+
+/**
+ * 0.5.x 的向量表是 vec_chunks(path, hash, …, scale, vec BLOB)：同一段文本在每个文件里
+ * 各存一份向量。0.6.0 起拆成 vec_content(hash PK, scale, vec) + vec_refs(path, hash, span)，
+ * 这里把老库一次性迁过去，然后删掉旧表。迁移是幂等的：中途失败下次打开会重试。
+ * @param {any} db
+ */
+function migrateVectorSchema(db) {
+  const old = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks'")
+    .get();
+  if (old === undefined) return;
+  const columns = db.prepare("SELECT name FROM pragma_table_info('vec_chunks')").all();
+  if (!columns.some((column) => column.name === 'vec')) return;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(
+      'INSERT OR IGNORE INTO vec_content(hash, scale, vec) SELECT hash, scale, vec FROM vec_chunks',
+    );
+    db.exec(
+      'INSERT OR IGNORE INTO vec_refs(path, chunk_ix, rid, start, len, hash) ' +
+        'SELECT path, chunk_ix, rid, start, len, hash FROM vec_chunks',
+    );
+    db.exec('DROP TABLE vec_chunks');
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
 
 export class Store {
   /** @param {string} file 数据库文件路径 */
@@ -145,6 +181,7 @@ export class Store {
   /** 建表；`files` 表存在即认为结构就绪。 */
   #create() {
     this.db.exec(CREATE_SQL);
+    migrateVectorSchema(this.db);
   }
 
   #prepare() {
@@ -372,6 +409,8 @@ export class Store {
     this.db.exec('DROP TABLE IF EXISTS files');
     this.db.exec('DROP TABLE IF EXISTS sessions');
     this.db.exec('DROP TABLE IF EXISTS vec_chunks');
+    this.db.exec('DROP TABLE IF EXISTS vec_content');
+    this.db.exec('DROP TABLE IF EXISTS vec_refs');
     this.db.exec('DROP TABLE IF EXISTS vec_meta');
     this.#create();
     this.#prepare();

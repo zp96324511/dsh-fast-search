@@ -204,10 +204,18 @@ Invoke-RestMethod "$api/search" -Method Post -ContentType 'application/json' `
 | `docsCovered` / `docsTotal` | 已覆盖文档数 / 应覆盖文档数（覆盖率） |
 | `progress.phase` | `idle` / `scanning` / `embedding` / `error` |
 | `progress.chars` / `charsTotal` | 本轮已嵌字符 / **去重后**待嵌字符 |
-| `progress.embedded` / `reused` | 本轮写入的引用数 / 其中直接复用已有向量的条数 |
-| `progress.rate` | 字符/秒（实测值，不受配置影响） |
-| `progress.etaMs` | 按当前速率估算的剩余时间 |
+| `progress.embedded` / `reused` | 本轮写入的引用数 / 其中直接复用已有向量的条数（**条数，不是字符数**） |
+| `progress.reusedChars` | 复用省下的字符数（只用于统计，不参与速率） |
+| `progress.chunkRate` | 块/秒（本轮已完成引用数 / 已用时）——**面板报的就是它** |
+| `progress.reuseRatio` | 复用率 = 复用引用 / 本轮新增引用（0–1） |
+| `progress.rate` | 字符/秒（仅统计；去重会让它失真，**不用于 ETA**） |
+| `progress.etaMs` | 按 `chunkRate` 倒推的剩余时间 |
 | `lastError` | 最近一次失败原因（服务不可达、4xx 原文） |
+
+**为什么面板报「块/秒 + 复用率」而不是「字符/秒」**：去重之后，一个重复块完成时字符增量为 0
+（向量早就在库里，只补一条引用），字符率会被稀释——实测 0.6.0 的字符率（1,346–1,379）
+反而低于 0.5.x（1,443–1,613），但同一时间的实际建库速度是快的。进度条的单位本来就是块，
+速率与 ETA 跟着块走才和用户看到的进度一致。字符率仍然保留在 `progress.rate` 里，只作统计。
 
 ## 8. 失败模式
 

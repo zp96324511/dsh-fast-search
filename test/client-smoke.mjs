@@ -62,9 +62,13 @@ const FAKE_STATUS = {
     model: 'bge-large',
     dim: 1024,
     chunks: 13219,
+    contents: 8420,
     docsCovered: 11890,
     docsTotal: 11890,
-    progress: { phase: 'idle', chunks: 13219, chunksTotal: 13219, chars: 5610128, charsTotal: 5610128 },
+    progress: {
+      phase: 'idle', chunks: 13219, chunksTotal: 13219, chars: 5610128, charsTotal: 5610128,
+      embedded: 0, reused: 0, reuseRatio: 0, chunkRate: 0, etaMs: 0,
+    },
   },
 };
 const FAKE_SEARCH = {
@@ -430,6 +434,32 @@ assert.equal(statusRow.children[2].type, 'button', '版本号排在重建按钮�
 assert.ok(String(statusRow.children[2].children.join('')).startsWith('v'), '版本号仍是版本号入口');
 assert.notEqual(statusRow.children[0].props.style.flex, '1 1 auto',
   '状态文字不能把重建按钮推到最右边');
+
+/* 语义进度行：报「块/秒 + 复用率」，不再报字符/秒——去重会让字符率失真 */
+slotState = ['插件', '插件', null, {
+  ...FAKE_STATUS,
+  vectors: {
+    ...FAKE_STATUS.vectors,
+    progress: {
+      ...FAKE_STATUS.vectors.progress,
+      phase: 'embedding', chunks: 9000, chunksTotal: 13219, chunkRate: 42.5, reuseRatio: 0.38,
+    },
+  },
+}, false, null, 0];
+const vecText = collectText(render(panel));
+assert.ok(vecText.includes('semanticIndexing'), '建库中要报进度，实际：' + vecText.slice(0, 300));
+assert.ok(vecText.includes('semanticRate'), '要报块/秒，实际：' + vecText.slice(0, 300));
+assert.ok(vecText.includes('42.5'), '速率小于 100 时保留一位小数，实际：' + vecText.slice(0, 300));
+assert.ok(vecText.includes('semanticReuse') && vecText.includes('"pct":"38"'),
+  '要报复用率 38%，实际：' + vecText.slice(0, 300));
+
+/* 空闲时改报静态去重率：唯一内容 8420 / 引用 13219 → 36% */
+slotState = ['插件', '插件', null, FAKE_STATUS, false, null, 0];
+const idleVecText = collectText(render(panel));
+assert.ok(idleVecText.includes('semanticIndex'), '空闲时要报块数，实际：' + idleVecText.slice(0, 300));
+assert.ok(idleVecText.includes('semanticUnique') && idleVecText.includes('8,420'),
+  '空闲时要报唯一内容数，实际：' + idleVecText.slice(0, 300));
+assert.ok(idleVecText.includes('"pct":"36"'), '空闲复用率按 1−唯一/引用 算，实际：' + idleVecText.slice(0, 300));
 
 /* 自定义时间段：状态回显绝对日期，日期框保留选中的值 */
 slotState = [

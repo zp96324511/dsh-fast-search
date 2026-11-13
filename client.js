@@ -98,7 +98,10 @@ window.__ModuleLoader__.load({
         semanticResults: '语义 {n} 条命中 · {groups} 个会话 · {ms}ms',
         semanticFailed: '语义召回失败，已退回纯全文',
         semanticIndexing: '语义索引 {done}/{total}',
-        semanticIndex: '语义索引 {done}/{total}',
+        semanticIndex: '语义索引 {blocks} 块',
+        semanticUnique: '唯一 {n}',
+        semanticRate: '{n} 块/秒',
+        semanticReuse: '复用 {pct}%',
         semanticBadge: '语义',
         allWorkspaces: '全部工作区',
         workspaceLabel: '工作区',
@@ -187,7 +190,10 @@ window.__ModuleLoader__.load({
         semanticResults: 'semantic {n} hits · {groups} sessions · {ms}ms',
         semanticFailed: 'Semantic recall failed, fell back to FTS',
         semanticIndexing: 'semantic index {done}/{total}',
-        semanticIndex: 'semantic index {done}/{total}',
+        semanticIndex: 'semantic index {blocks} blocks',
+        semanticUnique: '{n} unique',
+        semanticRate: '{n} blk/s',
+        semanticReuse: 'reused {pct}%',
         semanticBadge: 'semantic',
         allWorkspaces: 'All workspaces',
         workspaceLabel: 'Workspace',
@@ -352,6 +358,31 @@ window.__ModuleLoader__.load({
     function vecEmbedding(progress) {
       if (progress === null || progress === undefined) return false;
       return progress.phase === 'embedding' || progress.phase === 'scanning';
+    }
+
+    /** 速率：小于 100 保留一位小数，再大就取整——状态行只有一行宽。 */
+    function fmtRate(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) return '0';
+      return n >= 100 ? String(Math.round(n)) : n.toFixed(1);
+    }
+
+    /** 0–1 的比率 → 百分比整数。 */
+    function fmtPct(ratio) {
+      const n = Number(ratio);
+      if (!Number.isFinite(n) || n <= 0) return '0';
+      return String(Math.round(Math.min(1, n) * 100));
+    }
+
+    /** 复用率：建库中用本轮 reuseRatio（已知复用/本轮新增），空闲时用静态去重率
+     *  （1 − 唯一内容/引用）。两者都不是「字符」口径——去重会让字符率失真。 */
+    function reusePercent(vec, progress) {
+      const ratio = Number(progress?.reuseRatio);
+      if (vecEmbedding(progress) && Number.isFinite(ratio) && ratio > 0) return fmtPct(ratio);
+      const live = Number(vec?.chunks ?? 0);
+      const unique = Number(vec?.contents ?? 0);
+      if (live > 0 && unique > 0 && unique <= live) return fmtPct(1 - unique / live);
+      return null;
     }
 
     /** 全文对账是否在跑：宿主把进度放在 `status.index` 里，阶段是 scanning/indexing。 */
@@ -1408,17 +1439,26 @@ window.__ModuleLoader__.load({
         const vec = status.vectors;
         if (vec?.enabled === true) {
           const progress = vec.progress;
+          /* 进度行报「块/秒 + 复用率」，不报字符/秒：去重之后复用块字符增量为 0，
+           * 用字符率衡量建库速度会让人以为优化没生效（实测 0.6.0 的字符率反而低于 0.5.x）。 */
+          const reuse = reusePercent(vec, progress);
+          const bits = [];
           if (vecEmbedding(progress)) {
-            statusBits.push(t('semanticIndexing', {
+            bits.push(t('semanticIndexing', {
               done: fmtNum(progress.chunks ?? 0),
               total: fmtNum(progress.chunksTotal ?? 0),
             }));
+            if (Number(progress.chunkRate) > 0) {
+              bits.push(t('semanticRate', { n: fmtRate(progress.chunkRate) }));
+            }
           } else {
-            statusBits.push(t('semanticIndex', {
-              done: fmtNum(vec.chunks ?? 0),
-              total: fmtNum(progress?.chunksTotal ?? vec.chunks ?? 0),
-            }));
+            bits.push(t('semanticIndex', { blocks: fmtNum(vec.chunks ?? 0) }));
+            if (Number(vec.contents) > 0) {
+              bits.push(t('semanticUnique', { n: fmtNum(vec.contents) }));
+            }
           }
+          if (reuse !== null) bits.push(t('semanticReuse', { pct: reuse }));
+          statusBits.push(bits.join(' · '));
         }
       }
       const statusRow = h('div', { style: ST.statusRow, 'data-role': 'status' },

@@ -193,7 +193,7 @@ node cli.mjs search "让搜索更快一点的办法" --semantic on `
 
 | 路由 | 说明 |
 |---|---|
-| `GET /status` | `{ version, sessionsDir, dbPath, dbBytes, docs, sessions, files, searchMode, index: { phase, done, total, indexed, skipped, removed, lastError }, vectors: { enabled, ready, paused, model, dim, batch, concurrency, chunks, contents, bytes, docsCovered, docsTotal, progress: { phase, chunks, chunksTotal, chars, charsTotal, embedded, reused, rate, etaMs }, lastError } }` |
+| `GET /status` | `{ version, sessionsDir, dbPath, dbBytes, docs, sessions, files, searchMode, index: { phase, done, total, indexed, skipped, removed, lastError }, vectors: { enabled, ready, paused, model, dim, batch, concurrency, chunks, contents, bytes, docsCovered, docsTotal, progress: { phase, chunks, chunksTotal, chars, charsTotal, embedded, reused, reusedChars, chunkRate, reuseRatio, rate, etaMs }, lastError } }` |
 | `GET /workspaces` | `{ workspaces: [{ cwd, sessions, docs, updatedAt }] }`，按 `updatedAt`（该工作区最近一条消息）倒序 |
 | `GET\|POST /search` | 入参 `q`（必填）、`limit`（≤300）、`groupLimit`、`perSession`、`includeTotal`、`semantic`（`off`/`auto`/`on`，也接受 `true`/`false`）；筛选 `workspace`（cwd 原值）、`kinds`（消息类型数组或逗号分隔字符串，也接受单值别名 `kind`；值可用事件全名或短名 `user`/`assistant`/`tool`/`result`/`title`）、`since`/`until`（毫秒或 ISO 日期）、`range`（`1d`/`1w`/`1m`，也接受 `day`/`week`/`month` 等别名） |
 | `POST /reindex` | 触发全量对账（`force=true` 时整库重建），异步，进度看 `/status` |

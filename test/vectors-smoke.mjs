@@ -392,6 +392,11 @@ await checkAsync('第三场会话再说同样的话：零嵌入调用，只补�
   assert.equal(result.chars, 0, `不应嵌入任何字符，实际 ${result.chars}`);
   assert.equal(embedder2.calls, beforeCalls, '不该发起嵌入请求');
   assert.equal(embedder2.texts, beforeTexts);
+  /* 面板读的是块口径：reused 是「条数」不是字符数，复用率按本轮新增引用算 */
+  const progress = engine2.status().progress;
+  assert.equal(progress.reused, 1, `progress.reused 应为 1 条引用，实际 ${progress.reused}`);
+  assert.equal(progress.reuseRatio, 1, `纯复用的一轮复用率应为 1，实际 ${progress.reuseRatio}`);
+  assert.ok(progress.chunkRate > 0, `chunkRate 应大于 0，实际 ${progress.chunkRate}`);
 });
 
 await checkAsync('复用后三场会话都能被召回', async () => {

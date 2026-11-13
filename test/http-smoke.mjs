@@ -179,6 +179,11 @@ await check('/vectors/sync 入队并真的建出向量', async () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.ok(chunks > 0, '建库没有产出向量');
+  /* 面板用块口径：进度里要有 chunkRate 与 reuseRatio，且 reused 是条数不是字符数 */
+  const progress = (await call('/status')).json.vectors.progress;
+  assert.ok(Number.isFinite(progress.chunkRate), `chunkRate 缺失：${JSON.stringify(progress)}`);
+  assert.ok(Number.isFinite(progress.reuseRatio), `reuseRatio 缺失：${JSON.stringify(progress)}`);
+  assert.ok(Number.isInteger(progress.reused), `reused 应是引用条数：${progress.reused}`);
 });
 
 await check('/search 默认 auto：全文稀疏时补语义', async () => {

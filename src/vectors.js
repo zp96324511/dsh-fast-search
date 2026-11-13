@@ -573,7 +573,10 @@ export class VectorEngine {
       charsTotal: 0,
       embedded: 0,
       reused: 0,
+      reusedChars: 0,
       rate: 0,
+      chunkRate: 0,
+      reuseRatio: 0,
       etaMs: 0,
       startedAt: 0,
       finishedAt: 0,
@@ -774,7 +777,11 @@ export class VectorEngine {
       chars: 0,
       charsTotal: 0,
       embedded: 0,
+      reused: 0,
+      reusedChars: 0,
       rate: 0,
+      chunkRate: 0,
+      reuseRatio: 0,
       etaMs: 0,
       startedAt: started,
       finishedAt: 0,
@@ -853,9 +860,16 @@ export class VectorEngine {
      * 否则复用那部分会被算两遍（vs.live 已经把它们加进去了） */
     state.chunksTotal = vs.live + missing.length;
     state.charsTotal = totalChars;
-    state.reused = reusedChars;
-    if (reuseRows.length > 0) vs.insertMany(reuseRows);
+    state.reusedChars = reusedChars;
+    /* 复用率的分母是**本轮新增引用**：它回答「这轮要补的块里有多少白拿向量」，
+     * 一开始就确定，不会因为扫描先完成而瞬间显示 100%。 */
+    state.reuseRatio = missing.length > 0 ? reuseRows.length / missing.length : 0;
+    const reusedRefs = reuseRows.length > 0 ? vs.insertMany(reuseRows) : 0;
+    state.reused = reusedRefs;
     state.chunks = vs.live;
+    /* 进度条的单位是块，速率就用块/秒。字符/秒会被去重稀释（复用块字符增量为 0），
+     * 拿它衡量建库速度会让人以为优化没生效。 */
+    state.chunkRate = reusedRefs > 0 ? (reusedRefs / Math.max(1, Date.now() - started)) * 1000 : 0;
 
     if (missing.length === 0) {
       state.phase = 'idle';
@@ -884,7 +898,8 @@ export class VectorEngine {
     const ratePerMinute = Number(this.config.maxCharsPerMinute) || 0;
     const limit = maxChars > 0 ? maxChars : Infinity;
     let charsDone = 0;
-    let embedded = reuseRows.length;
+    let embedded = reusedRefs;
+    let newRefs = 0;
 
     for (let at = 0; at < todo.length; at += window) {
       if (this.stopped || this.paused) break;
@@ -905,15 +920,19 @@ export class VectorEngine {
         for (const ref of group.refs) rowsOut.push({ ...ref, data, scale });
         charsDone += group.text.length;
       }
-      embedded += vs.insertMany(rowsOut);
+      const written = vs.insertMany(rowsOut);
+      embedded += written;
+      newRefs += written;
       state.embedded = embedded;
       state.chunks = vs.live;
       state.chars = charsDone;
-      /* rate 统一用「字符/秒」对外，elapsed 是毫秒 → 乘 1000 换算；eta 再用同一单位倒推，
-         两边都乘/除同一个 1000，才不会出现差三个数量级的 ETA（曾经踩过）。 */
-      const elapsed = Date.now() - started;
-      state.rate = elapsed > 0 ? (charsDone / elapsed) * 1000 : 0;
-      state.etaMs = state.rate > 0 ? Math.round(((state.charsTotal - charsDone) / state.rate) * 1000) : 0;
+      /* 面板看的是「块/秒」：progress 的单位是块，速率与 ETA 就用块算，两者同一口径。
+       * 字符/秒（state.rate）只作为对外统计保留，不参与 ETA——去重会让它失真。 */
+      const elapsed = Math.max(1, Date.now() - started);
+      state.rate = (charsDone / elapsed) * 1000;
+      state.chunkRate = ((reusedRefs + newRefs) / elapsed) * 1000;
+      const remaining = Math.max(0, state.chunksTotal - state.chunks);
+      state.etaMs = state.chunkRate > 0 ? Math.round((remaining / state.chunkRate) * 1000) : 0;
 
       if (ratePerMinute > 0) {
         const target = (charsDone / ratePerMinute) * 60_000;
@@ -935,7 +954,7 @@ export class VectorEngine {
       }
     }
     this.log(
-      `[fast-search] 向量索引完成：新增 ${embedded} 块（复用 ${reuseRows.length}，清理 ${pruned}），` +
+      `[fast-search] 向量索引完成：新增 ${embedded} 块（复用 ${reusedRefs}，清理 ${pruned}），` +
         `共 ${vs.live} 块 / ${vs.liveContent} 份内容，嵌入 ${charsDone} 字符，` +
         `耗时 ${state.finishedAt - started}ms`,
     );
@@ -946,7 +965,8 @@ export class VectorEngine {
       chars: charsDone,
       pruned,
       retargeted,
-      reused: reuseRows.length,
+      reused: reusedRefs,
+      reusedChars,
       ms: state.finishedAt - started,
     };
   }

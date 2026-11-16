@@ -103,6 +103,16 @@ window.__ModuleLoader__.load({
         semanticRate: '{n} 块/秒',
         semanticReuse: '复用 {pct}%',
         semanticBadge: '语义',
+        semanticBothBadge: '全文+语义',
+        semanticThreshold: '阈值 {value}',
+        semanticThresholdOff: '阈值 关',
+        semanticThresholdTitle: '语义召回按余弦相似度过滤：最高分低于 {min} 时整轮不返回，单条低于 {floor} 的会被裁掉。改宿主配置 vectors.minScore 可调整。',
+        semanticTop: '最高 {value}',
+        semanticNoMatch: '语义无相关（最高 {top} < 阈值 {min}）',
+        similarityScore: '相似度 {value}',
+        similarityTitle: '向量余弦相似度 {score}；当前阈值 {min}。',
+        fusionScore: '融合 {value}',
+        fusionTitle: 'RRF 融合分 {score}：全文与向量按名次融合后的排序分，只用于排序，不能当相似度看。',
         allWorkspaces: '全部工作区',
         workspaceLabel: '工作区',
         rangeLabel: '时间',
@@ -195,6 +205,16 @@ window.__ModuleLoader__.load({
         semanticRate: '{n} blk/s',
         semanticReuse: 'reused {pct}%',
         semanticBadge: 'semantic',
+        semanticBothBadge: 'FTS+semantic',
+        semanticThreshold: 'threshold {value}',
+        semanticThresholdOff: 'threshold off',
+        semanticThresholdTitle: 'Semantic recall filters by cosine similarity: if the best score is below {min} nothing is recalled; items below {floor} are dropped. Tune vectors.minScore on the host.',
+        semanticTop: 'top {value}',
+        semanticNoMatch: 'no semantic match (top {top} < threshold {min})',
+        similarityScore: 'sim {value}',
+        similarityTitle: 'Vector cosine similarity {score}; current threshold {min}.',
+        fusionScore: 'RRF {value}',
+        fusionTitle: 'RRF fusion score {score}: rank-based blend of full-text and vector results; ordering only, not a similarity.',
         allWorkspaces: 'All workspaces',
         workspaceLabel: 'Workspace',
         rangeLabel: 'Time',
@@ -372,6 +392,37 @@ window.__ModuleLoader__.load({
       const n = Number(ratio);
       if (!Number.isFinite(n) || n <= 0) return '0';
       return String(Math.round(Math.min(1, n) * 100));
+    }
+
+    /** 分数统一按固定小数位显示，列才对得齐；非数字给破折号而不是 NaN。 */
+    function fmtScore(value, digits = 3) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toFixed(digits) : '—';
+    }
+
+    /** 当前生效的语义阈值：查询响应里的最准（本轮判定用的），其次看宿主 /status 的配置。 */
+    function currentThreshold(status, semantic) {
+      const fromQuery = Number(semantic?.threshold);
+      if (Number.isFinite(fromQuery)) return fromQuery;
+      const fromStatus = Number(status?.vectors?.minScore);
+      if (Number.isFinite(fromStatus)) return fromStatus;
+      return null;
+    }
+
+    /** 单条相关度的下限（minScore × 0.75），只用于解释分数，不单独显示成门槛。 */
+    function currentFloor(status, semantic) {
+      const fromQuery = Number(semantic?.floor);
+      if (Number.isFinite(fromQuery)) return fromQuery;
+      const fromStatus = Number(status?.vectors?.minItemScore);
+      if (Number.isFinite(fromStatus)) return fromStatus;
+      return null;
+    }
+
+    /** 分数越高越亮：一眼能看出哪些条目是刚过线、哪些是真的像。 */
+    function scoreChipStyle(score, threshold) {
+      const base = Number.isFinite(threshold) && threshold > 0 ? threshold : 0.5;
+      const ratio = Math.max(0, Math.min(1, (Number(score) - base) / Math.max(0.01, 1 - base)));
+      return { ...ST.scoreChip, opacity: 0.55 + 0.4 * ratio };
     }
 
     /** 复用率：建库中用本轮 reuseRatio（已知复用/本轮新增），空闲时用静态去重率
@@ -716,6 +767,40 @@ window.__ModuleLoader__.load({
         borderRadius: 999,
         padding: '0 6px',
         lineHeight: '15px',
+      },
+      /* 每条命中的分数：右对齐、等宽数字，扫一眼就能比较。
+       * 相似度按阈值拉亮度（见 scoreChipStyle），融合分是虚线弱化——两者口径不同，不能混着看。 */
+      scoreChip: {
+        flex: '0 0 auto',
+        fontSize: 10,
+        border: `1px solid ${line(16)}`,
+        borderRadius: 5,
+        padding: '0 5px',
+        lineHeight: '15px',
+        fontVariantNumeric: 'tabular-nums',
+        whiteSpace: 'nowrap',
+      },
+      fusionChip: {
+        flex: '0 0 auto',
+        fontSize: 10,
+        opacity: 0.5,
+        border: `1px dashed ${line(20)}`,
+        borderRadius: 5,
+        padding: '0 5px',
+        lineHeight: '15px',
+        fontVariantNumeric: 'tabular-nums',
+        whiteSpace: 'nowrap',
+      },
+      /* 语义下拉旁的阈值：不抢控件的宽度，但随时能看到当前门槛 */
+      thresholdChip: {
+        flex: '0 0 auto',
+        fontSize: 11,
+        opacity: 0.68,
+        border: `1px dashed ${line(24)}`,
+        borderRadius: 999,
+        padding: '2px 8px',
+        fontVariantNumeric: 'tabular-nums',
+        whiteSpace: 'nowrap',
       },
       snippet: {
         fontSize: 13,
@@ -1240,6 +1325,11 @@ window.__ModuleLoader__.load({
         if (text.trim() !== '') runSearch(text);
       }, [runSearch, text]);
 
+      const semantic = data?.semantic;
+      const semThreshold = currentThreshold(status, semantic);
+      const semFloor = currentFloor(status, semantic);
+      const semThresholdLabel = semThreshold !== null && semThreshold > 0 ? fmtScore(semThreshold, 2) : null;
+
       const meta = [];
       if (data !== null && data.empty !== true) {
         /* 纯语义召回时 FTS 的 total 会是 0，直接照抄会显示「0 条命中」——
@@ -1259,11 +1349,22 @@ window.__ModuleLoader__.load({
       } else if (busy) {
         meta.push(t('searching'));
       }
-      const semantic = data?.semantic;
       if (semantic?.used === true) {
         meta.push(t('semanticUsed', { n: fmtNum(semantic.hits ?? 0), ms: Number(semantic.ms ?? 0).toFixed(0) }));
+        /* 阈值与最高分跟着这一轮一起报：用户能在 0.55 这类数字前知道结果为什么多/少，
+         * 而不是只看到「语义补召 12 块」。 */
+        if (semThresholdLabel !== null) meta.push(t('semanticThreshold', { value: semThresholdLabel }));
+        if (Number.isFinite(Number(semantic.topScore))) {
+          meta.push(t('semanticTop', { value: fmtScore(semantic.topScore) }));
+        }
       } else if (semantic?.reason === 'error') {
         meta.push(t('semanticFailed'));
+      } else if (semantic?.reason === 'no-match') {
+        /* 低于门槛也是结果的一部分：不解释的话，用户只会看到「搜索没有找到」。 */
+        meta.push(t('semanticNoMatch', {
+          top: Number.isFinite(Number(semantic.topScore)) ? fmtScore(semantic.topScore) : '—',
+          min: semThresholdLabel ?? '—',
+        }));
       }
 
       /* 筛选回显：让用户一眼看出「为什么结果这么少」，而不是怀疑搜索坏了。 */
@@ -1425,6 +1526,20 @@ window.__ModuleLoader__.load({
           'aria-label': t('semanticLabel'),
           onChange: onSemChange,
         }, SEM_MODES.map((mode) => h('option', { key: mode, value: mode, style: optionStyle }, t(semChoice[mode])))),
+        /* 阈值紧挨着语义下拉：用户调完模式就能看到「现在按多少分过滤」。
+         * 旧宿主没有 minScore 字段时整枚不显示，不拿「阈值关」误导人。 */
+        semAvailable && semThreshold !== null
+          ? h('span', {
+            key: 'threshold',
+            style: ST.thresholdChip,
+            title: t('semanticThresholdTitle', {
+              min: semThreshold > 0 ? fmtScore(semThreshold, 2) : '0',
+              floor: semFloor !== null ? fmtScore(semFloor, 2) : '—',
+            }),
+          }, semThreshold > 0
+            ? t('semanticThreshold', { value: fmtScore(semThreshold, 2) })
+            : t('semanticThresholdOff'))
+          : null,
       );
 
       /* 索引状态单独一行：重建按钮跟在「x 条消息 · 语义索引 x/x」之后，
@@ -1512,6 +1627,12 @@ window.__ModuleLoader__.load({
               const isActive = index === active;
               const key = `${group.sessionId}:${doc.seq ?? index}`;
               index += 1;
+              /* 分数按来源分两种口径：向量召回显示余弦相似度；只有全文命中的条目显示
+               * RRF 融合分（纯排序分，量级只有 0.01x，所以用虚线弱化，不能与相似度比大小）。 */
+              const similarity = Number(doc.similarity);
+              const hasSimilarity = Number.isFinite(similarity);
+              const fusion = Number(doc.score);
+              const showFusion = !hasSimilarity && semantic?.used === true && Number.isFinite(fusion);
               return h('button', {
                 key,
                 type: 'button',
@@ -1521,8 +1642,25 @@ window.__ModuleLoader__.load({
               },
                 h('div', { style: ST.hitRow },
                   h('span', { style: ST.badge }, kindLabel(doc.kind)),
-                  doc.source === 'vec' ? h('span', { style: ST.semBadge }, t('semanticBadge')) : null,
+                  doc.source === 'vec'
+                    ? h('span', { style: ST.semBadge }, t('semanticBadge'))
+                    : (doc.source === 'both' ? h('span', { style: ST.semBadge }, t('semanticBothBadge')) : null),
                   h('span', { style: ST.groupMeta }, fmtTime(doc.time)),
+                  h('span', { style: { flex: '1 1 auto' } }),
+                  hasSimilarity
+                    ? h('span', {
+                      style: scoreChipStyle(similarity, semThreshold),
+                      title: t('similarityTitle', {
+                        score: fmtScore(similarity),
+                        min: semThresholdLabel ?? '—',
+                      }),
+                    }, t('similarityScore', { value: fmtScore(similarity) }))
+                    : (showFusion
+                      ? h('span', {
+                        style: ST.fusionChip,
+                        title: t('fusionTitle', { score: fmtScore(fusion, 4) }),
+                      }, t('fusionScore', { value: fmtScore(fusion, 4) }))
+                      : null),
                 ),
                 h('div', { style: ST.snippet },
                   (Array.isArray(doc.snippet) ? doc.snippet : [{ text: String(doc.text ?? '') }])

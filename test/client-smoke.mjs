@@ -65,6 +65,8 @@ const FAKE_STATUS = {
     contents: 8420,
     docsCovered: 11890,
     docsTotal: 11890,
+    minScore: 0.55,
+    minItemScore: 0.4125,
     progress: {
       phase: 'idle', chunks: 13219, chunksTotal: 13219, chars: 5610128, charsTotal: 5610128,
       embedded: 0, reused: 0, reuseRatio: 0, chunkRate: 0, etaMs: 0,
@@ -95,6 +97,7 @@ const FAKE_SEARCH = {
             { text: '插件', mark: true },
             { text: '的，可以按需开启', mark: false },
           ],
+          score: 0.0164,
         },
         {
           seq: 20,
@@ -102,6 +105,9 @@ const FAKE_SEARCH = {
           role: 'tool',
           time: Date.now() - 7_100_000,
           snippet: [{ text: 'mcp server plugin ready', mark: false }],
+          source: 'both',
+          similarity: 0.598,
+          score: 0.031,
         },
         {
           seq: 24,
@@ -110,11 +116,16 @@ const FAKE_SEARCH = {
           time: Date.now() - 7_000_000,
           snippet: [{ text: '把向量落盘之后再合并', mark: false }],
           source: 'vec',
+          similarity: 0.632,
+          score: 0.029,
         },
       ],
     },
   ],
-  semantic: { used: true, hits: 12, shown: 3, ms: 41, mode: 'auto', model: 'bge-large' },
+  semantic: {
+    used: true, hits: 12, shown: 3, ms: 41, mode: 'auto', model: 'bge-large',
+    threshold: 0.55, floor: 0.4125, topScore: 0.68,
+  },
 };
 
 /* 工作区下拉：真实接口按最近消息倒序返回 */
@@ -296,6 +307,16 @@ assert.ok(rendered.includes('插件会话级按需开启功能开发'), '会话�
 assert.ok(rendered.includes('834'), '命中总数要渲染出来，实际：' + rendered.slice(0, 200));
 assert.ok(rendered.includes('semanticUsed'), '语义补召之后要报出来，实际：' + rendered.slice(0, 300));
 assert.ok(rendered.includes('semanticBadge'), '纯语义命中的条目要带来源徽标，实际：' + rendered.slice(0, 300));
+assert.ok(rendered.includes('semanticBothBadge'), '两路都召回的条目要带「全文+语义」徽标，实际：' + rendered.slice(0, 300));
+/* 阈值与每条分数都要露在界面上：用户得能看懂为什么这条进来了、那条没进来 */
+assert.ok(rendered.includes('semanticThreshold') && rendered.includes('"value":"0.55"'),
+  'meta 行或下拉旁要有阈值 0.55，实际：' + rendered.slice(0, 400));
+assert.ok(rendered.includes('semanticTop') && rendered.includes('"value":"0.680"'),
+  '要显示本轮最高分 0.680，实际：' + rendered.slice(0, 400));
+assert.ok(rendered.includes('similarityScore') && rendered.includes('"value":"0.632"'),
+  '向量命中要显示余弦相似度，实际：' + rendered.slice(0, 400));
+assert.ok(rendered.includes('fusionScore') && rendered.includes('"value":"0.0164"'),
+  '只有全文命中的条目要显示 RRF 融合分，实际：' + rendered.slice(0, 400));
 assert.ok(rendered.includes('semanticAutoChoice'), '默认语义模式是「自动」，实际：' + rendered.slice(0, 300));
 assert.ok(rendered.includes('workspaceLabel'), '筛选行要有工作区标签，实际：' + rendered.slice(0, 300));
 assert.ok(rendered.includes('rangeDay') && rendered.includes('rangeWeek') && rendered.includes('rangeMonth'),

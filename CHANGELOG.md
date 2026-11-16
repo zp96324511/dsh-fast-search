@@ -1,5 +1,26 @@
 # 变更记录
 
+## 0.6.2 — 2026-11-16
+
+**语义阈值 0.45 → 0.55，并把判定过程显示到面板上。**
+
+23,339 块的生产库副本复测：相关查询 top 0.587–0.808，无关查询最高 0.463（天气）、0.419（电影）。
+旧的 0.45 落进无关区，天气类查询能过门；0.55 两边各留 0.037 / 0.087 的余量。
+
+- `src/vectors.js`：`DEFAULT_VECTORS.minScore` 升到 `0.55`；抽出 `ITEM_FLOOR_RATIO = 0.75`；
+  `semanticSearch()` 的**所有**返回分支（disabled / empty / 无候选 / no-match / ok）都带
+  `threshold` 与 `floor`；`status()` 新增 `minScore` 与 `minItemScore`（0.4125）。
+- `src/search.js`：`semantic` 对象在成功和空结果里都带 `threshold` / `floor`；
+  RRF 融合时 `both` 条目也带上 `similarity`，面板才能统一显示余弦分。
+- `client.js`：语义下拉旁显示本轮阈值；meta 行显示最高分；`no-match` 时直接写
+  「最高 x < 阈值 y」；每条结果右侧显示分数——向量/两路命中显示 `相似度 0.xxx`
+  （按阈值拉亮度），只有全文命中的显示 `融合 0.0xxx`（虚线圈，避免和相似度混着比大小）；
+  `both` 条目补「全文+语义」徽标。
+- 测试：`vectors-smoke` 断言阈值/下限随结果返回、`minScore` 真的读配置、`both` 带 `similarity`；
+  `http-smoke` 断言 `/status` 的 `minScore`/`minItemScore` 与 `no-match` 的阈值；
+  `client-smoke` 断言阈值、最高分、相似度、融合分都渲染出来。
+- 文档：README 与 `docs/semantic.md` 更新复测数据与 0.55；示例 patch 同步。
+
 ## 0.6.1 — 2026-11-13
 
 **面板的语义进度改报「块/秒 + 复用率」。**

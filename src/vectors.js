@@ -26,6 +26,9 @@ const BLOCK_SHIFT = 12;
 const BLOCK_SIZE = 1 << BLOCK_SHIFT;
 const BLOCK_MASK = BLOCK_SIZE - 1;
 
+/** 单条相关度的相对下限：低于 `minScore × 这个比例` 的尾巴直接裁掉（面板会把它显示出来）。 */
+const ITEM_FLOOR_RATIO = 0.75;
+
 /** 默认配置；`index.js` 会把 patch 里的 `vectors` 覆盖上来。 */
 export const DEFAULT_VECTORS = {
   enabled: false,
@@ -50,10 +53,14 @@ export const DEFAULT_VECTORS = {
   topK: 60,
   /**
    * 相关性门槛：**最佳分**低于它就整体不召回，单条再按 0.75×minScore 砍尾巴。
-   * 0.45 来自实测分布（bge-large / 中文会话语料）：相关查询 top 0.57–0.71，
-   * 无关查询 top 0.25–0.26，中间这段是安全区。设 0 可关掉门控（全量返回 topK 条）。
+   *
+   * 0.55 来自 2026-11-16 的复测（生产库 77k 文档 / 23.3k 块，bge-large，12 个查询）：
+   * 相关查询 top 0.587–0.808；无关查询「今天天气怎么样」0.463、「有没有推荐的电影」0.419。
+   * 0.45 已经落在无关区间里——天气查询能把秋天作文顶进来，所以上调到空档中段的 0.55。
+   * 语料变多会让无关查询的 top 缓慢抬高（上一轮测天气还只有 0.257），这个值要随语料复测。
+   * 设 0 可关掉门控（全量返回 topK 条）。
    */
-  minScore: 0.45,
+  minScore: 0.55,
   sweepMs: 30 * 60 * 1000,
   timeoutMs: 120_000,
   queryCacheSize: 32,
@@ -977,29 +984,34 @@ export class VectorEngine {
    * @param {{ topK?: number, accept?: ((rid: number) => boolean) | null }} [options]
    */
   async semanticSearch(q, { topK, accept = null } = {}) {
-    if (!this.enabled) return { hits: [], reason: 'disabled', ms: 0 };
+    /* 门槛参数跟着结果一起回给上层：面板要显示「阈值 / 单条下限」，
+     * 命令行排查时也能直接看到这次判定用的是哪一档。 */
+    const minScore = Number(this.config.minScore) || 0;
+    const floor = minScore > 0 ? minScore * ITEM_FLOOR_RATIO : 0;
+    if (!this.enabled) return { hits: [], reason: 'disabled', ms: 0, threshold: minScore, floor };
     await this.init();
     const vs = this.vs;
-    if (vs === null || vs.size === 0) return { hits: [], reason: 'empty', ms: 0 };
+    if (vs === null || vs.size === 0) {
+      return { hits: [], reason: 'empty', ms: 0, threshold: minScore, floor };
+    }
 
     const started = Date.now();
     const queryVec = await this.embedQuery(q);
     const { data, scale } = quantize(queryVec);
     const k = Math.max(1, Math.trunc(topK ?? this.config.topK) || 60);
     const found = vs.search(data, scale, k, accept);
-    if (found.length === 0) return { hits: [], reason: 'no-match', ms: Date.now() - started };
+    if (found.length === 0) {
+      return { hits: [], reason: 'no-match', topScore: null, threshold: minScore, floor, ms: Date.now() - started };
+    }
 
-    /* 门槛分两道，理由都是实测的相似度分布（bge-large，中文会话语料）：
-     *   相关查询 top 0.57–0.71，p50 0.33–0.42；
-     *   无关查询（「今天天气怎么样」）top 只有 0.25–0.26。
+    /* 门槛分两道，理由都是实测的相似度分布（bge-large，中文会话语料，2026-11-16 复测）：
+     *   相关查询 top 0.587–0.808；无关查询 top 0.419–0.463（天气查询已能摸到 0.46）。
      * 所以「最佳分 < minScore」就整体判为没有相关——别把 60 条不相干的块塞进结果；
-     * 单条再用 0.75×minScore 砍尾巴，头部几条和排名不变。 */
-    const minScore = Number(this.config.minScore) || 0;
+     * 单条再用 floor（0.75×minScore）砍尾巴，头部几条和排名不变。 */
     const topScore = found[0].score;
     if (minScore > 0 && topScore < minScore) {
-      return { hits: [], reason: 'no-match', topScore, ms: Date.now() - started };
+      return { hits: [], reason: 'no-match', topScore, threshold: minScore, floor, ms: Date.now() - started };
     }
-    const floor = minScore > 0 ? minScore * 0.75 : 0;
     const kept = floor > 0 ? found.filter((item) => item.score >= floor) : found;
 
     const metas = this.store.docsByRid(JSON.stringify(kept.map((item) => item.rid)));
@@ -1021,7 +1033,15 @@ export class VectorEngine {
         chunk: text.slice(from, to),
       });
     }
-    return { hits, reason: 'ok', topScore, ms: Date.now() - started, model: this.config.model };
+    return {
+      hits,
+      reason: 'ok',
+      topScore,
+      threshold: minScore,
+      floor,
+      ms: Date.now() - started,
+      model: this.config.model,
+    };
   }
 
   /** @param {string} q */
@@ -1078,6 +1098,9 @@ export class VectorEngine {
       chunkChars: this.config.chunkChars,
       batch: Number(this.config.batch) || 8,
       concurrency: Number(this.config.concurrency) || 1,
+      /* 门槛：面板在语义下拉旁显示 minScore，并在每条命中上按 minItemScore 解释分数。 */
+      minScore: Number(this.config.minScore) || 0,
+      minItemScore: Math.round((Number(this.config.minScore) || 0) * ITEM_FLOOR_RATIO * 10000) / 10000,
       chunks: stats.chunks,
       contents: stats.contents,
       bytes: stats.bytes,

@@ -66,7 +66,14 @@ export async function searchWithSemantic({ store, engine, q, options = {}, mode 
   if (!Array.isArray(recall.hits) || recall.hits.length === 0) {
     return {
       ...fts,
-      semantic: { used: false, reason: recall.reason ?? 'empty', topScore: recall.topScore ?? null, ms: recall.ms ?? 0 },
+      semantic: {
+        used: false,
+        reason: recall.reason ?? 'empty',
+        topScore: recall.topScore ?? null,
+        threshold: recall.threshold ?? null,
+        floor: recall.floor ?? null,
+        ms: recall.ms ?? 0,
+      },
     };
   }
 
@@ -87,6 +94,8 @@ export async function searchWithSemantic({ store, engine, q, options = {}, mode 
       hits: recall.hits.length,
       shown: fused.shown,
       topScore: recall.topScore === undefined ? null : round(recall.topScore),
+      threshold: recall.threshold ?? null,
+      floor: recall.floor ?? null,
       ms: recall.ms ?? 0,
       mode,
     },
@@ -192,7 +201,11 @@ export function fuse(ftsGroups, hits, { store, words, perSession, groupLimit }) 
     if (group.docs.length >= perSession) continue;
 
     if (entry.fts !== undefined) {
-      group.docs.push({ ...entry.fts, source: entry.source, score: round(entry.score) });
+      /* 同时被两路召回的文档也要带上余弦相似度：面板每条命中都显示分数，
+       * 否则「全文+语义」的条目会看起来比纯语义条目少一个数。 */
+      const doc = { ...entry.fts, source: entry.source, score: round(entry.score) };
+      if (entry.vec !== undefined) doc.similarity = round(entry.vec.score);
+      group.docs.push(doc);
     } else {
       const hit = entry.vec;
       const snippet = buildSnippet(hit.chunk ?? '', words);

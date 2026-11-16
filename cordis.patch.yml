@@ -19,7 +19,7 @@
 #           batch: 8
 #           concurrency: 2
 #           autoThreshold: 5
-#           minScore: 0.45
+#           minScore: 0.55
 - insert:
     - id: fast-search
       name: dsh-fast-search

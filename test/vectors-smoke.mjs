@@ -222,11 +222,35 @@ await checkAsync('向量命中携带可渲染的片段与元数据', async () =>
   assert.ok(top.chunk.length > 0 && top.chunk.length <= 200);
 });
 
+await checkAsync('语义召回带出门槛与单条下限，面板才能显示分数', async () => {
+  const recall = await engine.semanticSearch('加速', { topK: 5 });
+  assert.equal(recall.reason, 'ok');
+  assert.equal(recall.threshold, 0.55, `默认阈值应为 0.55，实际 ${recall.threshold}`);
+  assert.ok(Math.abs(recall.floor - 0.4125) < 1e-9, `单条下限应为 0.75×0.55，实际 ${recall.floor}`);
+  for (const hit of recall.hits) assert.ok(hit.score >= recall.floor, `命中分数 ${hit.score} 低于下限`);
+});
+
 await checkAsync('无关查询被 minScore 挡住，不把噪声当结果', async () => {
   const recall = await engine.semanticSearch('今天天气怎么样', { topK: 5 });
   assert.equal(recall.reason, 'no-match');
   assert.equal(recall.hits.length, 0);
-  assert.ok(typeof recall.topScore === 'number' && recall.topScore < 0.45, `topScore ${recall.topScore}`);
+  assert.equal(recall.threshold, 0.55);
+  assert.ok(typeof recall.topScore === 'number' && recall.topScore < 0.55, `topScore ${recall.topScore}`);
+});
+
+await checkAsync('阈值可覆盖：调到 1.01 时相关查询也应整体不召回', async () => {
+  const saved = engine.config.minScore;
+  try {
+    /* 假嵌入器同义词的余弦接近 1，只有超过 1 的门槛才能把相关查询挡住——
+     * 这条验的是「门槛真的读配置」，不是语义质量。 */
+    engine.config.minScore = 1.01;
+    const recall = await engine.semanticSearch('加速', { topK: 5 });
+    assert.equal(recall.reason, 'no-match');
+    assert.equal(recall.threshold, 1.01);
+    assert.ok(recall.topScore < 1.01);
+  } finally {
+    engine.config.minScore = saved;
+  }
 });
 
 await checkAsync('FTS 字面命中时不掺向量（auto 模式）', async () => {
@@ -254,6 +278,8 @@ await checkAsync('FTS 空结果时自动补语义（auto 模式）', async () =>
     options: { limit: 300, groupLimit: 20, perSession: 6 },
   });
   assert.equal(result.semantic.used, true);
+  assert.equal(result.semantic.threshold, 0.55, '响应里要带本轮阈值，面板才能显示');
+  assert.ok(Math.abs(result.semantic.floor - 0.4125) < 1e-9, '响应里要带单条下限');
   assert.ok(result.groups.length > 0, '融合后应该有分组');
   const docs = result.groups.flatMap((group) => group.docs);
   const semanticDocs = docs.filter((doc) => doc.source === 'vec');
@@ -261,6 +287,26 @@ await checkAsync('FTS 空结果时自动补语义（auto 模式）', async () =>
   const doc = semanticDocs[0];
   assert.ok(Array.isArray(doc.snippet) && doc.snippet.length > 0, '语义命中要有片段');
   assert.equal(result.groups[0].sessionId, 'session-a');
+});
+
+await checkAsync('融合后每条命中都带分数（both 也要有 similarity）', async () => {
+  const result = await searchWithSemantic({
+    store,
+    engine,
+    q: '缓存',
+    mode: 'on',
+    options: { limit: 300, groupLimit: 20, perSession: 6 },
+  });
+  assert.equal(result.semantic.used, true);
+  const docs = result.groups.flatMap((group) => group.docs);
+  assert.ok(docs.length > 0);
+  for (const doc of docs) assert.ok(Number.isFinite(doc.score), '每条都要有 RRF 融合分');
+  const both = docs.filter((doc) => doc.source === 'both');
+  assert.ok(both.length > 0, '应该有同时被两路召回的文档');
+  for (const doc of both) assert.ok(Number.isFinite(doc.similarity), 'both 条目缺 similarity');
+  for (const doc of docs.filter((item) => item.source === 'vec')) {
+    assert.ok(Number.isFinite(doc.similarity), '纯语义条目缺 similarity');
+  }
 });
 
 await checkAsync('off 模式不碰向量', async () => {

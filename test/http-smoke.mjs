@@ -164,6 +164,9 @@ await check('/status 带语义索引状态与默认模式', async () => {
   assert.equal(res.json.vectors.enabled, true);
   assert.equal(res.json.vectors.dim, DIM);
   assert.equal(res.json.vectors.chunks, 0);
+  /* 面板要展示阈值，状态里必须给默认 minScore 与单条下限 */
+  assert.equal(res.json.vectors.minScore, 0.55, `minScore 应为 0.55，实际 ${res.json.vectors.minScore}`);
+  assert.equal(res.json.vectors.minItemScore, 0.4125, `minItemScore 应为 0.4125，实际 ${res.json.vectors.minItemScore}`);
 });
 
 await check('/vectors/sync 入队并真的建出向量', async () => {
@@ -191,8 +194,13 @@ await check('/search 默认 auto：全文稀疏时补语义', async () => {
   assert.equal(res.status, 200);
   assert.equal(res.json.semantic.used, true);
   assert.equal(res.json.semantic.mode, 'auto');
+  assert.equal(res.json.semantic.threshold, 0.55);
+  assert.ok(Math.abs(res.json.semantic.floor - 0.4125) < 1e-9);
   const docs = res.json.groups.flatMap((group) => group.docs);
   assert.ok(docs.some((doc) => doc.source === 'vec'), '没有纯语义命中');
+  for (const doc of docs.filter((item) => item.source === 'vec')) {
+    assert.ok(Number.isFinite(doc.similarity), '纯语义命中要带 cosine similarity');
+  }
 });
 
 await check('/search semantic:"off" 不碰向量', async () => {
@@ -213,6 +221,8 @@ await check('/search 无关查询被 minScore 挡住', async () => {
   const res = await call('/search', { method: 'POST', body: JSON.stringify({ q: '今天天气怎么样', semantic: 'on' }) });
   assert.equal(res.json.semantic.used, false);
   assert.equal(res.json.semantic.reason, 'no-match');
+  assert.equal(res.json.semantic.threshold, 0.55);
+  assert.ok(res.json.semantic.topScore < 0.55, `topScore ${res.json.semantic.topScore} 应低于阈值`);
 });
 
 await check('/workspaces 返回工作区、会话数与文档数', async () => {

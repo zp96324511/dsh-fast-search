@@ -318,6 +318,23 @@ assert.ok(rendered.includes('similarityScore') && rendered.includes('"value":"0.
 assert.ok(rendered.includes('fusionScore') && rendered.includes('"value":"0.0164"'),
   '只有全文命中的条目要显示 RRF 融合分，实际：' + rendered.slice(0, 400));
 assert.ok(rendered.includes('semanticAutoChoice'), '默认语义模式是「自动」，实际：' + rendered.slice(0, 300));
+
+/* 被门槛挡住时，空结果上方也要解释原因，而不是只显示「没有找到」 */
+const NO_MATCH = {
+  ...FAKE_SEARCH,
+  q: '天气',
+  total: 0,
+  groups: [],
+  semantic: {
+    used: false, reason: 'no-match', topScore: 0.463, threshold: 0.55, floor: 0.4125,
+    hits: 0, shown: 0, ms: 30, mode: 'on', model: 'bge-large',
+  },
+};
+slotState = ['天气', '天气', NO_MATCH, FAKE_STATUS, false, null, 0];
+const noMatchText = collectText(render(panel));
+assert.ok(noMatchText.includes('semanticNoMatch'), 'no-match 要解释「最高 < 阈值」，实际：' + noMatchText.slice(0, 300));
+assert.ok(noMatchText.includes('"top":"0.463"') && noMatchText.includes('"min":"0.55"'),
+  'no-match 要带上最高分与阈值，实际：' + noMatchText.slice(0, 300));
 assert.ok(rendered.includes('workspaceLabel'), '筛选行要有工作区标签，实际：' + rendered.slice(0, 300));
 assert.ok(rendered.includes('rangeDay') && rendered.includes('rangeWeek') && rendered.includes('rangeMonth'),
   '时间要提供 1 天 / 1 周 / 1 月 快捷档，实际：' + rendered.slice(0, 300));

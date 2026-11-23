@@ -473,7 +473,9 @@ assert.ok(String(statusRow.children[2].children.join('')).startsWith('v'), '版�
 assert.notEqual(statusRow.children[0].props.style.flex, '1 1 auto',
   '状态文字不能把重建按钮推到最右边');
 
-/* 语义进度行：报「块/秒 + 复用率」，不再报字符/秒——去重会让字符率失真 */
+/* 语义进度行：建库中只报「进度 + 块/秒」，不报复用率，也不报字符/秒——去重会让字符率失真，
+ * 而建库中的复用率（本轮白拿的向量 / 本轮新增引用）从空库重建时恒为 0%，建完却可能是 49%，
+ * 中途显示只会误导；复用率等跑完再按「1 − 唯一/引用」算（见 0.6.3）。 */
 slotState = ['插件', '插件', null, {
   ...FAKE_STATUS,
   vectors: {
@@ -488,8 +490,21 @@ const vecText = collectText(render(panel));
 assert.ok(vecText.includes('semanticIndexing'), '建库中要报进度，实际：' + vecText.slice(0, 300));
 assert.ok(vecText.includes('semanticRate'), '要报块/秒，实际：' + vecText.slice(0, 300));
 assert.ok(vecText.includes('42.5'), '速率小于 100 时保留一位小数，实际：' + vecText.slice(0, 300));
-assert.ok(vecText.includes('semanticReuse') && vecText.includes('"pct":"38"'),
-  '要报复用率 38%，实际：' + vecText.slice(0, 300));
+assert.ok(!vecText.includes('semanticReuse'),
+  '建库中不报复用率（宿主给了 reuseRatio 也不显示），实际：' + vecText.slice(0, 300));
+
+/* 暂停也没跑完：同样不报复用率 */
+slotState = ['插件', '插件', null, {
+  ...FAKE_STATUS,
+  vectors: {
+    ...FAKE_STATUS.vectors,
+    progress: { ...FAKE_STATUS.vectors.progress, phase: 'paused', reuseRatio: 0.38 },
+  },
+}, false, null, 0];
+const pausedVecText = collectText(render(panel));
+assert.ok(pausedVecText.includes('semanticIndex'), '暂停时按已落盘的块数报，实际：' + pausedVecText.slice(0, 300));
+assert.ok(!pausedVecText.includes('semanticReuse'),
+  '暂停时没跑完，不报复用率，实际：' + pausedVecText.slice(0, 300));
 
 /* 空闲时改报静态去重率：唯一内容 8420 / 引用 13219 → 36% */
 slotState = ['插件', '插件', null, FAKE_STATUS, false, null, 0];

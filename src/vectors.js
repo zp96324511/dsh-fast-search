@@ -869,7 +869,8 @@ export class VectorEngine {
     state.charsTotal = totalChars;
     state.reusedChars = reusedChars;
     /* 复用率的分母是**本轮新增引用**：它回答「这轮要补的块里有多少白拿向量」，
-     * 一开始就确定，不会因为扫描先完成而瞬间显示 100%。 */
+     * 一开始就确定，不会因为扫描先完成而瞬间显示 100%。注意这不是语料去重率——
+     * 从空库重建时它恒为 0，所以面板只在建完之后按「1 − 唯一/引用」报去重率。 */
     state.reuseRatio = missing.length > 0 ? reuseRows.length / missing.length : 0;
     const reusedRefs = reuseRows.length > 0 ? vs.insertMany(reuseRows) : 0;
     state.reused = reusedRefs;

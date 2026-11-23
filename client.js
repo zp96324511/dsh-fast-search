@@ -380,6 +380,12 @@ window.__ModuleLoader__.load({
       return progress.phase === 'embedding' || progress.phase === 'scanning';
     }
 
+    /** 本轮建库是否已经跑完：暂停、出错都不算——说「索引已经生成完」才敢报去重率。 */
+    function vecSettled(progress) {
+      if (progress === null || progress === undefined) return true;
+      return progress.phase === 'idle';
+    }
+
     /** 速率：小于 100 保留一位小数，再大就取整——状态行只有一行宽。 */
     function fmtRate(value) {
       const n = Number(value);
@@ -425,11 +431,13 @@ window.__ModuleLoader__.load({
       return { ...ST.scoreChip, opacity: 0.55 + 0.4 * ratio };
     }
 
-    /** 复用率：建库中用本轮 reuseRatio（已知复用/本轮新增），空闲时用静态去重率
-     *  （1 − 唯一内容/引用）。两者都不是「字符」口径——去重会让字符率失真。 */
-    function reusePercent(vec, progress) {
-      const ratio = Number(progress?.reuseRatio);
-      if (vecEmbedding(progress) && Number.isFinite(ratio) && ratio > 0) return fmtPct(ratio);
+    /** 复用率 = 1 − 唯一内容/引用，只在建库跑完之后报（完整语料才成立）。
+     *
+     *  建库中不算这个数：那会儿表里只有本轮已写入的部分，分母还在涨；更关键的是
+     *  `progress.reuseRatio` 是「本轮白拿的向量 / 本轮新增引用」，它衡量的不是去重率——
+     *  从空库重建时根本没有旧向量可复用，整个过程中它恒为 0%，建完立刻变成 49%，
+     *  这种中途读数只会误导（实测 2026-11-23：49,522/49,853 时显示「复用 0%」）。 */
+    function reusePercent(vec) {
       const live = Number(vec?.chunks ?? 0);
       const unique = Number(vec?.contents ?? 0);
       if (live > 0 && unique > 0 && unique <= live) return fmtPct(1 - unique / live);
@@ -1554,9 +1562,9 @@ window.__ModuleLoader__.load({
         const vec = status.vectors;
         if (vec?.enabled === true) {
           const progress = vec.progress;
-          /* 进度行报「块/秒 + 复用率」，不报字符/秒：去重之后复用块字符增量为 0，
-           * 用字符率衡量建库速度会让人以为优化没生效（实测 0.6.0 的字符率反而低于 0.5.x）。 */
-          const reuse = reusePercent(vec, progress);
+          /* 进度行报「块/秒」，不报字符/秒：去重之后复用块字符增量为 0，
+           * 用字符率衡量建库速度会让人以为优化没生效（实测 0.6.0 的字符率反而低于 0.5.x）。
+           * 复用率只在建完之后补上——建库中那个数不是去重率，见 reusePercent()。 */
           const bits = [];
           if (vecEmbedding(progress)) {
             bits.push(t('semanticIndexing', {
@@ -1571,8 +1579,9 @@ window.__ModuleLoader__.load({
             if (Number(vec.contents) > 0) {
               bits.push(t('semanticUnique', { n: fmtNum(vec.contents) }));
             }
+            const reuse = vecSettled(progress) ? reusePercent(vec) : null;
+            if (reuse !== null) bits.push(t('semanticReuse', { pct: reuse }));
           }
-          if (reuse !== null) bits.push(t('semanticReuse', { pct: reuse }));
           statusBits.push(bits.join(' · '));
         }
       }
